@@ -11,14 +11,13 @@ from app.helper.downloader import DownloaderHelper
 from app.helper.sites import SitesHelper
 from app.schemas.types import NotificationType
 from app.core.cache import TTLCache
-from app.chain.identify import IdentifyChain
 
 class SeedRescuer(_PluginBase):
     # 插件基本信息
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "3.6"
+    plugin_version = "3.7"
     plugin_author = "Gemini"
 
     # 内部变量
@@ -38,7 +37,6 @@ class SeedRescuer(_PluginBase):
     def init_plugin(self, config: dict = None):
         self.downloader_helper = DownloaderHelper()
         self.sites_helper = SitesHelper()
-        self.identify_chain = IdentifyChain()
         self.cache = TTLCache(region="SeedRescuer", maxsize=1000, ttl=86400)
         
         if not self.cache.get("stats"):
@@ -90,7 +88,7 @@ class SeedRescuer(_PluginBase):
                                 ]
                             },
                             {
-                                "component": "VRow", "props": {"class": "mt-2"},
+                                "component": "VRow", props={"class": "mt-2"},
                                 "content": [
                                     {"component": "VCol", "content": [
                                         {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-2"}, "content": "🔍 扫描磁盘", "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
@@ -176,21 +174,22 @@ class SeedRescuer(_PluginBase):
         target = next((i for i in items if i["id"] == item_id), None)
         if not target: return {"code": 1, "message": "项目失效"}
 
-        search_queries = [
-            target["name"].replace(".", " "), 
-            re.sub(r'\[.*?\]', '', target["name"].replace(".", " ")).strip() 
-        ]
-        
-        meta = self.identify_chain.recognize(title=target["name"])
-        if meta and meta.name:
-            search_queries.append(f"{meta.name} {meta.year if meta.year else ''}")
+        # 核心识别与搜索逻辑：完全解耦 MoviePilot 内部 IdentifyChain
+        search_queries = []
+        # 1. 原始全特征名 (最精准)
+        search_queries.append(target["name"].replace(".", " "))
+        # 2. 去中括号名 (过滤组标签)
+        search_queries.append(re.sub(r'\[.*?\]', '', target["name"].replace(".", " ")).strip())
+        # 3. 智能正则解析提取 (标题+年份) - 代替原 IdentifyChain 逻辑
+        clean_title = self._parse_media_name(target["name"])
+        if clean_title:
+            search_queries.append(clean_title)
 
         best_torrent = None
         best_diff = 1.0
 
         for query in list(dict.fromkeys(search_queries)): 
             self.debug(f"尝试搜索词: {query}")
-            # 修改：使用 sites_helper 的搜索接口，它在 V2 中更稳定
             results = self.sites_helper.search(keyword=query, site_ids=self._selected_sites)
             best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
             if best_torrent: break 
@@ -205,6 +204,28 @@ class SeedRescuer(_PluginBase):
         
         stats["failed"] += 1; self.cache.set("stats", stats)
         return {"code": 1, "message": "未匹配到完全一致的种子"}
+
+    def _parse_media_name(self, name: str) -> str:
+        """
+        内置 PT 命名解析逻辑，无需依赖外部 Chain
+        提取 标题 + 年份 或 标题 + Sxx
+        """
+        # 匹配年份 (19xx/20xx)
+        year_match = re.search(r'[\.\s](19|20)\d{2}[\.\s]', name)
+        # 匹配季号 (S01-99)
+        season_match = re.search(r'[\.\s]S\d{2}[\.\s]', name, re.I)
+        
+        # 寻找切分点
+        split_point = -1
+        if year_match: split_point = year_match.start()
+        elif season_match: split_point = season_match.start()
+        
+        if split_point > 0:
+            title = name[:split_point].replace(".", " ").strip()
+            suffix = name[split_point:].split(".")[1] if "." in name[split_point:] else ""
+            return f"{title} {suffix}".strip()
+        
+        return ""
 
     def test_run(self, **kwargs):
         self.scan_now()
@@ -299,9 +320,7 @@ class SeedRescuer(_PluginBase):
         if self._path_mapping and ":" in self._path_mapping:
             internal, external = self._path_mapping.split(":")
             save_path = save_path.replace(internal.replace("\\", "/"), external.replace("\\", "/"))
-        # TR 路径标准化
         save_path = save_path.rstrip("/")
-        # MoviePilot 封装的 add_torrent 接口在 TR 下支持 enclosure 或 torrent_url
         return downloader.instance.add_torrent(torrent_url=torrent.get('enclosure'), save_path=save_path, is_paused=self._only_paused, tag="SeedRescuer")
 
     def _format_size(self, size: int) -> str:
