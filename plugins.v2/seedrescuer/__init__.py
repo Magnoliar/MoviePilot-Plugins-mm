@@ -9,7 +9,6 @@ from app.plugins import _PluginBase
 from app.core.config import settings
 from app.helper.downloader import DownloaderHelper
 from app.helper.sites import SitesHelper
-from app.helper.search import SearchHelper
 from app.schemas.types import NotificationType
 from app.core.cache import TTLCache
 from app.chain.identify import IdentifyChain
@@ -19,7 +18,7 @@ class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "3.5"
+    plugin_version = "3.6"
     plugin_author = "Gemini"
 
     # 内部变量
@@ -39,7 +38,6 @@ class SeedRescuer(_PluginBase):
     def init_plugin(self, config: dict = None):
         self.downloader_helper = DownloaderHelper()
         self.sites_helper = SitesHelper()
-        self.search_helper = SearchHelper()
         self.identify_chain = IdentifyChain()
         self.cache = TTLCache(region="SeedRescuer", maxsize=1000, ttl=86400)
         
@@ -192,7 +190,8 @@ class SeedRescuer(_PluginBase):
 
         for query in list(dict.fromkeys(search_queries)): 
             self.debug(f"尝试搜索词: {query}")
-            results = self.search_helper.search_medias(keyword=query, site_ids=self._selected_sites)
+            # 修改：使用 sites_helper 的搜索接口，它在 V2 中更稳定
+            results = self.sites_helper.search(keyword=query, site_ids=self._selected_sites)
             best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
             if best_torrent: break 
 
@@ -267,6 +266,8 @@ class SeedRescuer(_PluginBase):
         return names
 
     def _match_torrent(self, search_results: List[Any], target_size: int, local_name: str) -> Tuple[Optional[Dict], float]:
+        if not search_results: return None, 1.0
+        
         def get_priority(t):
             try: return self._selected_sites.index(t.get('site_id'))
             except: return 999
@@ -298,7 +299,10 @@ class SeedRescuer(_PluginBase):
         if self._path_mapping and ":" in self._path_mapping:
             internal, external = self._path_mapping.split(":")
             save_path = save_path.replace(internal.replace("\\", "/"), external.replace("\\", "/"))
-        return downloader.instance.add_torrent(torrent_url=torrent.get('enclosure'), save_path=save_path.rstrip("/"), is_paused=self._only_paused, tag="SeedRescuer")
+        # TR 路径标准化
+        save_path = save_path.rstrip("/")
+        # MoviePilot 封装的 add_torrent 接口在 TR 下支持 enclosure 或 torrent_url
+        return downloader.instance.add_torrent(torrent_url=torrent.get('enclosure'), save_path=save_path, is_paused=self._only_paused, tag="SeedRescuer")
 
     def _format_size(self, size: int) -> str:
         for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
