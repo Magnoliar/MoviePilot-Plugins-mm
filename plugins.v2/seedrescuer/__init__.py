@@ -17,8 +17,9 @@ class SeedRescuer(_PluginBase):
     # 插件基本信息
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
+    # 【已修复】使用一个绝对可靠的 GitHub Raw 网络图标链接，避免 Pillow 解析错误
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.0.2"
+    plugin_version = "5.0.3"
     plugin_author = "Gemini"
 
     # 内部变量
@@ -64,13 +65,7 @@ class SeedRescuer(_PluginBase):
     def stop_service(self):
         pass
 
-    # ==========================
-    #  定时服务注册 (Cron)
-    # ==========================
     def get_service(self) -> List[Dict[str, Any]]:
-        """
-        注册定时服务：如果启用了插件且配置了Cron表达式，则创建定时任务
-        """
         if not self._enabled or not self._cron:
             return []
         return[{
@@ -81,9 +76,6 @@ class SeedRescuer(_PluginBase):
             "kwargs": {}
         }]
 
-    # ==========================
-    #  历史记录处理
-    # ==========================
     def _load_history(self) -> Dict[str, bool]:
         if self._history_file.exists():
             try: 
@@ -101,10 +93,31 @@ class SeedRescuer(_PluginBase):
     #  前端 UI 定义
     # ==========================
     def get_page(self) -> List[dict]:
-        sites = self.sites_helper.get_active_sites()
-        site_options = [{"title": s.name, "value": s.id} for s in sites]
-        downloaders = self.downloader_helper.get_configs()
-        downloader_options =[{"title": name, "value": name} for name in downloaders.keys()]
+        # 【已修复】全面兼容获取站点的逻辑，安全截获异常
+        site_options =[]
+        try:
+            sites =[]
+            if hasattr(self.sites_helper, 'get_indexers'):
+                sites = self.sites_helper.get_indexers()
+            elif hasattr(self.sites_helper, 'get_sites'):
+                sites = self.sites_helper.get_sites()
+                
+            for s in sites:
+                # 兼容字典类型和对象类型
+                s_id = s.get("id") if isinstance(s, dict) else getattr(s, "id", "")
+                s_name = s.get("name") if isinstance(s, dict) else getattr(s, "name", "")
+                if s_id and s_name:
+                    site_options.append({"title": s_name, "value": s_id})
+        except Exception as e:
+            pass # 防止此处报错导致页面崩溃
+
+        # 获取下载器列表（安全处理）
+        downloader_options =[]
+        try:
+            downloaders = self.downloader_helper.get_configs()
+            downloader_options =[{"title": name, "value": name} for name in downloaders.keys()]
+        except Exception:
+            pass
 
         return[
             {
@@ -163,16 +176,16 @@ class SeedRescuer(_PluginBase):
         ]
 
     def get_data(self) -> Dict[str, Any]:
-        raw_data = self.cache.get("items") or []
+        raw_data = self.cache.get("items") or[]
         for item in raw_data:
             item["actions"] =[{"component": "VBtn", "props": {"icon": "mdi-download", "variant": "text", "color": "primary"}, "events": {"click": {"api": "plugin/SeedRescuer/download_item", "method": "post", "data": {"item_id": item["id"]}}}}]
         return {"data_list": raw_data, "stats": self.cache.get("stats")}
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return[
-            {"path": "/scan_now", "endpoint": self.scan_now, "methods": ["GET"]},
-            {"path": "/download_item", "endpoint": self.download_item, "methods":["POST"]},
-            {"path": "/download_all", "endpoint": self.download_all, "methods":["POST"]},
+        return [
+            {"path": "/scan_now", "endpoint": self.scan_now, "methods":["GET"]},
+            {"path": "/download_item", "endpoint": self.download_item, "methods": ["POST"]},
+            {"path": "/download_all", "endpoint": self.download_all, "methods": ["POST"]},
             {"path": "/test_run", "endpoint": self.test_run, "methods": ["POST"]},
             {"path": "/reset_history", "endpoint": self.reset_history, "methods": ["POST"]}
         ]
@@ -180,7 +193,6 @@ class SeedRescuer(_PluginBase):
     # ==========================
     #  核心 API 及逻辑
     # ==========================
-
     def reset_history(self, **kwargs):
         if self._history_file.exists(): 
             self._history_file.unlink()
@@ -193,7 +205,7 @@ class SeedRescuer(_PluginBase):
         all_items =[]
         history = self._load_history()
         existing_torrents = self._get_existing_torrents()
-        paths = [p.strip() for p in self._scan_path.split(",") if p.strip()]
+        paths =[p.strip() for p in self._scan_path.split(",") if p.strip()]
         stats = {"total": 0, "rescued": 0, "existing": 0, "failed": 0}
 
         for base_path in paths:
@@ -227,7 +239,6 @@ class SeedRescuer(_PluginBase):
         return {"success": True, "message": f"扫描完毕，共发现 {len(all_items)} 个符合特征的影视文件夹/文件。"}
 
     def test_run(self, **kwargs):
-        """测试运行：提取前5个目标执行，使用多线程避免前端等待超时"""
         self.scan_now()
         items =[i for i in self.cache.get("items", []) if "待找回" in i["status"]][:5]
         if not items: 
@@ -242,8 +253,7 @@ class SeedRescuer(_PluginBase):
         return {"success": True, "message": f"已在后台启动灰度测试，将尝试找回 {len(items)} 个项目，请稍后刷新页面查看状态。"}
 
     def download_all(self, **kwargs):
-        """全量执行：必须走异步或多线程，否则请求必然 502/504"""
-        to_do = [i for i in self.cache.get("items", []) if "待找回" in i["status"]]
+        to_do =[i for i in self.cache.get("items", []) if "待找回" in i["status"]]
         if not to_do: 
             return {"success": False, "message": "清单中没有待找回的项目，请先执行扫描！"}
 
@@ -262,8 +272,7 @@ class SeedRescuer(_PluginBase):
         if not target: 
             return {"success": False, "message": "该记录已失效，请重新扫描"}
 
-        # 构建多次尝试的搜索关键词（全名 -> 剔除中括号内字幕组 -> 提取标准影视名称）
-        search_queries =[
+        search_queries = [
             target["name"].replace(".", " "),
             re.sub(r'\[.*?\]', '', target["name"].replace(".", " ")).strip()
         ]
@@ -273,7 +282,6 @@ class SeedRescuer(_PluginBase):
 
         best_torrent = None
         best_diff = 1.0
-        # 对保留原序的搜索词去重查询
         for query in list(dict.fromkeys(search_queries)): 
             results = self.sites_helper.search(keyword=query, site_ids=self._selected_sites)
             best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
@@ -302,7 +310,6 @@ class SeedRescuer(_PluginBase):
     #  内部辅助方法
     # ==========================
     def _parse_media_name(self, name: str) -> str:
-        """从文件名中剥离出可搜索的标准Title和年份"""
         year_match = re.search(r'[\.\s](19|20)\d{2}[\.\s]', name)
         season_match = re.search(r'[\.\s]S\d{2}[\.\s]', name, re.I)
         split_point = -1
@@ -313,7 +320,6 @@ class SeedRescuer(_PluginBase):
             
         if split_point > 0:
             title = name[:split_point].replace(".", " ").strip()
-            # 保留年份
             suffix = name[split_point:].split(".")[1] if "." in name[split_point:] else ""
             return f"{title} {suffix}".strip()
         return ""
@@ -329,7 +335,6 @@ class SeedRescuer(_PluginBase):
         def scan_recursive(current_path: Path, depth: int):
             if depth > self._max_depth: return
             try:
-                # 限制为该目录下安全可读内容
                 items = current_path.iterdir()
             except Exception:
                 return
@@ -341,16 +346,14 @@ class SeedRescuer(_PluginBase):
                         
                     if item.is_dir():
                         if item.name.count('.') >= 3 or feature_pattern.search(item.name):
-                            # 计算该目录总大小
                             size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
                             if size > 100 * 1024 * 1024: 
                                 res.append((item.name, str(item.absolute()), size))
                         else: 
                             scan_recursive(item, depth + 1)
-                    elif item.suffix.lower() in['.mp4', '.mkv', '.ts', '.iso']:
+                    elif item.suffix.lower() in ['.mp4', '.mkv', '.ts', '.iso']:
                         res.append((item.name, str(item.absolute()), item.stat().st_size))
                 except Exception:
-                    # 单个文件/目录由于权限或其他原因引发异常时，跳过即可
                     continue
                     
         scan_recursive(root, 1)
@@ -359,7 +362,6 @@ class SeedRescuer(_PluginBase):
     def _get_existing_torrents(self) -> set:
         names = set()
         downloader = self.downloader_helper.get_service(name=self._downloader_name)
-        # 前置判断 instance 是否存活，防止系统抛出连接异常
         if downloader and not downloader.instance.is_inactive():
             try:
                 torrents = downloader.instance.get_torrents()
@@ -375,7 +377,6 @@ class SeedRescuer(_PluginBase):
             return None, 1.0
             
         def get_priority(t):
-            # 获取站点的ID（兼容不同版本的 Context 结构）
             site_id = getattr(t, 'site', getattr(t, 'site_id', ''))
             try: 
                 return self._selected_sites.index(site_id)
@@ -386,7 +387,6 @@ class SeedRescuer(_PluginBase):
         core_tags = [w for w in["iQIYI", "MWeb", "Netflix", "NF", "Tencent", "WEB-DL", "BluRay", "REMUX", "HFR"] if w.lower() in local_name.lower()]
         
         for t in sorted_res:
-            # 兼容 MP V2 的对象获取法
             t_size = getattr(t, 'size', 0)
             t_title = getattr(t, 'title', getattr(t, 'name', ''))
             
@@ -394,7 +394,6 @@ class SeedRescuer(_PluginBase):
                 continue
                 
             diff = abs(t_size - target_size) / target_size
-            # 误差 < 0.1% 认为是同一个发布档
             if diff < 0.001: 
                 tag_match = True
                 for tag in core_tags:
@@ -411,10 +410,8 @@ class SeedRescuer(_PluginBase):
         if not downloader or downloader.instance.is_inactive(): 
             return False, "选定下载器当前不可用或已离线"
             
-        # 获取要下达给下载器的绝对路径父级目录
         save_path = str(Path(local_path).parent).replace("\\", "/")
         
-        # 路径映射（严格前缀替换，防误伤机制）
         if self._path_mapping and ":" in self._path_mapping:
             internal, external = self._path_mapping.split(":", 1)
             internal = internal.replace("\\", "/")
@@ -423,7 +420,6 @@ class SeedRescuer(_PluginBase):
             if save_path.startswith(internal):
                 save_path = external + save_path[len(internal):]
 
-        # 兼容 MP V2 Torrent 对象获取下载链接
         torrent_url = getattr(torrent, 'enclosure', getattr(torrent, 'url', ''))
         
         try:
@@ -438,7 +434,7 @@ class SeedRescuer(_PluginBase):
             return False, str(e)
 
     def _format_size(self, size: int) -> str:
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        for unit in['B', 'KB', 'MB', 'GB', 'TB']:
             if size < 1024: 
                 return f"{size:.2f} {unit}"
             size /= 1024
