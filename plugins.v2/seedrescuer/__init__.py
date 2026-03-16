@@ -24,16 +24,16 @@ from apscheduler.triggers.cron import CronTrigger
 
 class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
-    plugin_desc = "基于特征扫描智能找回种子。(v5.3.2 终极解题：内置API Token配置与数据库直读，强破403)"
+    plugin_desc = "基于特征扫描智能找回种子。(v5.2.9 绕过全局过滤规则，直调底层爬虫接口)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.3.2"  # 核心升级：增加 API Token 专属配置，彻底打通系统内部的 HTTP 搜索网络
+    plugin_version = "5.3.5"  # 核心升级：废弃可能导致误屏蔽的 SearchChain，直连底层 Indexer 获取绝对原始数据
     plugin_author = "Gemini"
     
     auth_level = 1
 
     _enabled = False
     _notify = True
-    _api_token = ""  # 新增 API Token 配置
+    _api_token = ""
     _scan_path = ""
     _selected_sites =[]
     _downloader_name = ""
@@ -55,7 +55,6 @@ class SeedRescuer(_PluginBase):
         self.stop_service()
         self._exit_event.clear()
 
-        # 初始化独立日志
         self._setup_logger()
 
         self.downloader_helper = DownloaderHelper()
@@ -157,6 +156,36 @@ class SeedRescuer(_PluginBase):
             "kwargs": {}
         }]
 
+    # ==========================
+    #  微信/TG 远程控制命令
+    # ==========================
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        try:
+            from app.schemas.types import EventType
+            return[{
+                "cmd": "/seed_rescue",
+                "event": EventType.PluginAction,
+                "desc": "全盘扫描并自动化找回种子",
+                "category": "下载器",
+                "data": {"action": "seed_rescue"}
+            }]
+        except ImportError:
+            return[]
+
+    # 这里通过名称直接匹配，防止 EventType 导入失败
+    def on_event(self, event: Any):
+        if hasattr(event, "event_type") and str(event.event_type).endswith("PluginAction"):
+            event_data = getattr(event, "event_data", {})
+            if event_data and event_data.get("action") == "seed_rescue":
+                self._logger.info("收到远程命令，开始在后台执行全量自动化找回...")
+                if self._notify:
+                    self.post_message(channel=event_data.get("channel"),
+                                      title="种子找回助手已启动",
+                                      text="收到远程指令，开始扫描磁盘并全量找回，请稍后查看结果战报。",
+                                      userid=event_data.get("user"))
+                self.download_all()
+
     def _load_history(self) -> Dict[str, bool]:
         if self._history_file.exists():
             try: 
@@ -216,7 +245,7 @@ class SeedRescuer(_PluginBase):
                 {
                     "component": "VRow",
                     "content":[
-                        {"component": "VCol", "props": {"cols": 12}, "content":[{"component": "VTextField", "props": {"model": "api_token", "label": "系统 API Token (用于破除 403 搜索拦截)", "placeholder": "请前往 设置->系统设置 中复制您的 API令牌 并粘贴至此", "hint": "必填推荐！因为 MPV2 权限极严，当直接读取数据库 Token 失败时，会依赖此配置强行破除 403 封锁并发起内部搜索！"}}] }
+                        {"component": "VCol", "props": {"cols": 12}, "content":[{"component": "VTextField", "props": {"model": "api_token", "label": "系统 API Token (非必填)", "placeholder": "仅 HTTP 内部兜底调用时需要", "hint": "由于本版本已彻底重构为直调最底层的爬虫模块，该 Token 仅作为最后一道极限容灾的备用手段。"}}] }
                     ]
                 },
                 {
@@ -240,7 +269,7 @@ class SeedRescuer(_PluginBase):
                         {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VTextField", "props": {"model": "sleep_min", "label": "检索最小延迟(秒)", "type": "number", "hint": "随机等待下限，防止风控。"}}] },
                         {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VTextField", "props": {"model": "sleep_max", "label": "检索最大延迟(秒)", "type": "number", "hint": "随机等待上限。"}}] },
                         {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VSwitch", "props": {"model": "only_paused", "label": "强行暂停添加", "hint": "推送到下载器后强制暂停状态。"}}] },
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VSwitch", "props": {"model": "hide_existing", "label": "隐藏已存在项目", "hint": "不在下方清单展示已存在项目。"}}] }
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VSwitch", "props": {"model": "hide_existing", "label": "过滤已在下载器的资源", "hint": "开启后，100%匹配且已存在于下载器的项目将直接被过滤剔除，不在下方清单内展示。"}}] }
                     ]
                 }
             ]
@@ -303,7 +332,7 @@ class SeedRescuer(_PluginBase):
             })
 
         if not tbody_content:
-            text_hint = "暂无扫描数据" if not self._hide_existing else "暂无需要找回的数据 (已存在的项目已被隐藏)"
+            text_hint = "暂无扫描数据" if not self._hide_existing else "暂无数据 (100%匹配的已存在项已被过滤隐藏)"
             tbody_content.append({
                 "component": "tr",
                 "content":[{"component": "td", "props": {"colspan": 5, "class": "text-center text-grey"}, "text": text_hint}]
@@ -386,8 +415,7 @@ class SeedRescuer(_PluginBase):
     def get_data(self) -> Dict[str, Any]:
         data_list = self.cache.get("items") or[]
         
-        # 提取待找回或失败的纯净片名，用于供前端的 VTextarea 直出显示
-        failed_names = [item['name'] for item in data_list if item.get("status") in ["⏳ 待找回", "❌ 匹配失败"]]
+        failed_names = [item['name'] for item in data_list if item.get("status") in["⏳ 待找回", "❌ 匹配失败"]]
         failed_list_text = "\n".join(failed_names)
         if not failed_list_text:
             failed_list_text = "✨ 太棒了！目前没有任何待找回或匹配失败的项目。"
@@ -474,7 +502,7 @@ class SeedRescuer(_PluginBase):
             self.cache.set("items", all_items)
             self.cache.set("stats", stats)
             
-            msg_suffix = " (已隐藏已存在项目)" if self._hide_existing else ""
+            msg_suffix = " (已过滤已存在项目)" if self._hide_existing else ""
             self.cache.set("status_msg", f"空闲中 (上次扫描完毕，共渲染 {len(all_items)} 个项目{msg_suffix})")
             self._logger.info(f"磁盘扫描完成，共处理 {len(items)} 个文件，展示 {len(all_items)} 项")
             return {"success": True, "message": f"扫描完毕，共发现 {len(items)} 个影视资源。"}
@@ -559,39 +587,48 @@ class SeedRescuer(_PluginBase):
         finally:
             self._task_lock.release()
 
-    # 核心解题：四重容灾链路深度修复，打通系统底层的 HTTP 内部请求
+    # 核心重构：抛弃可能携带屏蔽规则的 SearchChain，直接通过底层的 Indexer 获取纯净的 Raw 数据
     def _search_torrents(self, query: str, site_ids: list = None) -> List[Any]:
         results = None
-        
-        # 1. TorrentsChain / SearchChain
-        if results is None:
-            try:
-                from app.chain.search import SearchChain
-                try:
-                    ctx = SearchChain().process(title=query)
-                except TypeError:
-                    ctx = SearchChain().process(keyword=query)
-                if ctx:
-                    results = getattr(ctx, 'torrents', getattr(ctx, 'records', getattr(ctx, 'return_data', ctx)))
-            except Exception as e:
-                self._logger.debug(f"SearchChain 容灾调用失败: {e}")
+        mediainfo = None
 
-        # 2. Indexer
+        # 1. 尝试将目录名转换为带 TMDb 信息的规范化对象，提高爬虫检索命准率
+        try:
+            from app.core.metainfo import MetaInfo
+            meta = MetaInfo(title=query)
+            mediainfo = self.chain.recognize_media(meta=meta)
+            if mediainfo:
+                self._logger.info(f"  ├─ 媒体识别成功: {mediainfo.title_year}")
+        except Exception as e:
+            self._logger.debug(f"媒体识别异常(降级纯关键字匹配): {e}")
+
+        # 2. 核心：直接调用 Indexer，它不受全局质量、压制组过滤规则的影响，返回所有原始结果
         if results is None:
             try:
                 from app.modules.indexer import Indexer
+                indexer = Indexer()
                 try:
-                    res = Indexer().search_torrents(title=query)
+                    res = indexer.search_torrents(mediainfo=mediainfo, keyword=query)
                 except TypeError:
-                    res = Indexer().search_torrents(keyword=query)
-                if res is not None: results = res
+                    try:
+                        res = indexer.search_torrents(keyword=query)
+                    except TypeError:
+                        res = indexer.search_torrents(title=query)
+                if res: results = res
             except Exception as e:
-                self._logger.debug(f"Indexer 容灾调用失败: {e}")
+                self._logger.warning(f"容灾1 (Indexer直通) 调用失败: {e}", exc_info=True)
 
-        # 3. 终极容灾：通过设置或数据库动态获取 Token 突破 403 HTTP 拦截！
+        # 3. 旧版兼容容灾：SitesHelper
+        if results is None and hasattr(self.sites_helper, 'search'):
+            try:
+                res = self.sites_helper.search(keyword=query)
+                if res: results = res
+            except Exception as e:
+                self._logger.warning(f"容灾2 (SitesHelper) 调用失败: {e}", exc_info=True)
+
+        # 4. HTTP 直接请求兜底 (如果前面模块因为系统大改版被删除)
         if results is None:
             try:
-                # 优先级：UI输入的Token > 系统环境变量Token > 系统数据库直查Token
                 token = self._api_token or getattr(settings, "API_TOKEN", "")
                 if not token:
                     try:
@@ -602,7 +639,6 @@ class SeedRescuer(_PluginBase):
                         
                 port = getattr(settings, "PORT", 3000)
                 if token:
-                    # 确保 Header 和 Param 都带上，防止某些版本的特殊拦截
                     headers = {"Authorization": f"Bearer {token}"}
                     params = {"keyword": query, "token": token}
                     
@@ -617,15 +653,11 @@ class SeedRescuer(_PluginBase):
                             results = data
                         elif isinstance(data, dict) and 'data' in data:
                             results = data['data']
-                    else:
-                        self._logger.warning(f"HTTP 内部接口请求状态异常，Code: {res.status_code if res else 'None'}")
-                else:
-                    self._logger.warning("未检测到 API Token，HTTP 内部接口容灾被跳过！")
             except Exception as e:
-                self._logger.warning(f"内部 HTTP 搜索发生异常: {e}", exc_info=True)
+                self._logger.warning(f"容灾3 (HTTP兜底) 请求异常: {e}", exc_info=True)
 
         if results is None:
-            self._logger.error("  ├─ ❌ 致命错误: 系统未开放任何搜索 API 接口，所有容灾链路调用均告失败！请确认是否正确填写了【系统 API Token】。")
+            self._logger.error("  ├─ ❌ 致命错误: 系统未开放任何无过滤的搜索 API 接口，所有容灾链路调用均告失败！")
             return[]
             
         valid_results =[]
@@ -635,6 +667,7 @@ class SeedRescuer(_PluginBase):
             else:
                 valid_results.append(t)
                 
+        # 基于你在设置页选的白名单，进行本地过滤
         if site_ids:
             filtered =[]
             for t in valid_results:
@@ -704,7 +737,6 @@ class SeedRescuer(_PluginBase):
                 self.cache.set("items", items)
                 self.cache.set("stats", stats)
                 self._logger.info(f"  └─ ✔ 找回并推送成功: {target['name']}")
-                self._send_notify("种子找回成功", f"成功找回并推送至下载器：\n{target['name']}\n精准度：{100-best_diff*100:.1f}%")
                 return {"success": True, "message": f"找回成功！精准度: {100-best_diff*100:.1f}%"}
             else:
                 self._logger.warning(f"  └─ ⚠ 找回成功但推送到下载器失败: {msg}")
@@ -845,7 +877,7 @@ class SeedRescuer(_PluginBase):
                 else:
                     self._logger.info(f"    └─ [⏭ 跳过] 标签不符: {t_title}")
             else:
-                self._logger.info(f"    └─[⏭ 跳过] 体积不符: {t_title} (远程体积: {self._format_size(t_size)} | 差距: {diff*100:.2f}%)")
+                self._logger.info(f"    └─ [⏭ 跳过] 体积不符: {t_title} (远程体积: {self._format_size(t_size)} | 差距: {diff*100:.2f}%)")
                     
         self._logger.info(f"    └─ 无完全匹配项。最小体积误差: {best_diff*100:.2f}%")
         return None, best_diff
