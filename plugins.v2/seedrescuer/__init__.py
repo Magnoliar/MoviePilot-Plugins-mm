@@ -20,9 +20,9 @@ from apscheduler.triggers.cron import CronTrigger
 
 class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
-    plugin_desc = "基于特征扫描智能找回种子。(v5.2.1 修复UI动态渲染、表格空白与按钮无文字问题)"
+    plugin_desc = "基于特征扫描智能找回种子。(v5.2.2 增加全景搜索日志、优化关键词提取与误差宽容度)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.2.1"  # 修复 MoviePilot 动态页面引擎无法渲染 Vue 变量与 VDataTable 的问题
+    plugin_version = "5.2.2"  # 核心升级：大幅增强匹配透明度日志、修正状态回写丢失问题、放宽 3% 匹配误差
     plugin_author = "Gemini"
     
     auth_level = 1
@@ -84,7 +84,6 @@ class SeedRescuer(_PluginBase):
         log_dir = Path(getattr(settings, "LOG_PATH", "/moviepilot/logs")) / "plugins"
         log_dir.mkdir(parents=True, exist_ok=True)
         
-        # 匹配前端请求的 /api/v1/system/logging?logfile=plugins/seedrescuer.log
         self.log_file = log_dir / "seedrescuer.log"
         if not self.log_file.exists():
             self.log_file.touch()
@@ -102,7 +101,6 @@ class SeedRescuer(_PluginBase):
         console_handler.setFormatter(formatter)
         self._logger.addHandler(console_handler)
         
-        # 立即写入一条日志，确保文件被实际创建并持有，解决 404 问题
         self._logger.info("[SeedRescuer] 插件日志模块初始化完毕。")
 
     def get_state(self) -> bool:
@@ -243,36 +241,43 @@ class SeedRescuer(_PluginBase):
         }
 
     # ==========================
-    #  数据看板展示页面 (深度修复引擎渲染机制)
+    #  数据看板展示页面
     # ==========================
     def get_page(self) -> List[dict]:
-        # 获取当前缓存数据
         stats = self.cache.get("stats") or {"total": 0, "rescued": 0, "existing": 0, "failed": 0}
         status_msg = self.cache.get("status_msg") or "空闲中 (等待任务指令)"
         data_list = self.cache.get("items") or[]
 
-        # 动态构建 VTable 表体内容，抛弃不支持原生渲染的 VDataTable
         tbody_content =[]
         for item in data_list:
+            # 根据状态着色
+            status_text = str(item.get("status", ""))
+            status_color = "text-grey"
+            if "✨" in status_text:
+                status_color = "text-success font-weight-bold"
+            elif "❌" in status_text:
+                status_color = "text-error font-weight-bold"
+            elif "✅" in status_text:
+                status_color = "text-info font-weight-bold"
+
             tbody_content.append({
                 "component": "tr",
                 "content":[
                     {"component": "td", "text": str(item.get("name", ""))},
                     {"component": "td", "text": str(item.get("size_str", ""))},
-                    {"component": "td", "text": str(item.get("status", ""))},
+                    {"component": "td", "props": {"class": status_color}, "text": status_text},
                     {"component": "td", "text": str(item.get("confidence", ""))},
                     {"component": "td", "content":[
                         {
                             "component": "VBtn",
                             "props": {"color": "primary", "variant": "tonal", "size": "small", "prepend-icon": "mdi-download"},
-                            "text": "下载",  # Button 的直接文字节点
+                            "text": "下载",
                             "events": {"click": {"api": "plugin/SeedRescuer/download_item", "method": "get", "params": {"item_id": item["id"]}}}
                         }
                     ]}
                 ]
             })
 
-        # 空状态提示
         if not tbody_content:
             tbody_content.append({
                 "component": "tr",
@@ -299,7 +304,6 @@ class SeedRescuer(_PluginBase):
                 "props": {"class": "mt-4 mb-4"},
                 "content":[
                     {"component": "VCol", "content":[
-                        # 重点修复：MoviePilot 渲染器使用 root "text" 作为按钮文本
                         {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-magnify"}, "text": "扫描磁盘", "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
                         {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-test-tube"}, "text": "灰度测试", "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "get"}}},
                         {"component": "VBtn", "props": {"color": "success", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-rocket"}, "text": "全量找回", "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "get"}}},
@@ -311,7 +315,6 @@ class SeedRescuer(_PluginBase):
                 "component": "VCard",
                 "props": {"title": "找回清单"},
                 "content":[
-                    # 重点修复：使用标准的 VTable 构建数据清单，支持完美解析
                     {
                         "component": "VTable",
                         "props": {"hover": True, "fixed-header": True, "density": "comfortable"},
@@ -339,7 +342,6 @@ class SeedRescuer(_PluginBase):
             }
         ]
 
-    # 由于采用了 VTable 原生全量渲染，不需要再依赖 get_data 返回给底层接管
     def get_data(self) -> Dict[str, Any]:
         return {}
 
@@ -348,7 +350,7 @@ class SeedRescuer(_PluginBase):
     # ==========================
     def get_api(self) -> List[Dict[str, Any]]:
         return[
-            {"path": "/scan_now", "endpoint": self.scan_now, "methods": ["GET"], "summary": "扫描磁盘", "auth": "bear"},
+            {"path": "/scan_now", "endpoint": self.scan_now, "methods":["GET"], "summary": "扫描磁盘", "auth": "bear"},
             {"path": "/test_run", "endpoint": self.test_run, "methods": ["GET"], "summary": "灰度测试", "auth": "bear"},
             {"path": "/download_all", "endpoint": self.download_all, "methods":["GET"], "summary": "全量自动化找回", "auth": "bear"},
             {"path": "/reset_history", "endpoint": self.reset_history, "methods": ["GET"], "summary": "重置找回历史记录", "auth": "bear"},
@@ -494,63 +496,89 @@ class SeedRescuer(_PluginBase):
         if not target: 
             return {"success": False, "message": "该记录已失效，请重新扫描"}
 
-        clean_name = re.sub(r'\[.*?\]', '', target["name"].replace(".", " ")).strip()
+        self._logger.info(f"▶ 开始尝试找回: [{target['name']}] (原始体积: {self._format_size(target['size'])})")
+
+        # 核心修复 2: 剔除干扰符号，提高提取纯净关键词成功率
+        clean_name = re.sub(r'[\[\]\(\)\{\}\-\_\￡\@]', ' ', target["name"]).replace(".", " ")
+        clean_name = re.sub(r'\s+', ' ', clean_name).strip()
+
         search_queries =[
-            target["name"].replace(".", " "),
-            clean_name if clean_name else target["name"] 
+            clean_name,
+            target["name"].replace(".", " ")
         ]
         clean_title = self._parse_media_name(target["name"])
         if clean_title: 
             search_queries.append(clean_title)
 
+        # 核心修复 1: 增加找回全景日志，让检索过程透明化
+        search_queries = list(dict.fromkeys(search_queries))
+        self._logger.info(f"  ├─ 生成检索关键词: {search_queries}")
+
         best_torrent = None
         best_diff = 1.0
         
-        for query in list(dict.fromkeys(search_queries)): 
+        for query in search_queries: 
+            if not query: continue
             if hasattr(self.sites_helper, 'search'):
                 try:
+                    self._logger.info(f"  ├─ 发起搜索: '{query}'")
                     results = self.sites_helper.search(keyword=query, site_ids=self._selected_sites)
+                    self._logger.info(f"  ├─ 收到结果: {len(results) if results else 0} 条，进入二次校验...")
                     best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
                     if best_torrent: 
                         break 
                 except Exception as e:
-                    self._logger.error(f"站点搜索失败 {query}: {e}", exc_info=True)
+                    self._logger.error(f"  ├─ 站点搜索抛出异常 [{query}]: {e}", exc_info=True)
 
         if best_torrent:
             success, msg = self._download_and_add(best_torrent, target["path"])
             if success:
                 target["status"] = "✨ 找回成功"
-                target["confidence"] = f"{100-best_diff*100:.3f}%"
+                target["confidence"] = f"{100-best_diff*100:.1f}%"
                 stats["rescued"] += 1
                 self._save_history(target["name"])
                 
                 self.cache.set("items", items)
                 self.cache.set("stats", stats)
-                self._logger.info(f"找回成功: {target['name']}")
-                return {"success": True, "message": f"找回成功！精准度: {100-best_diff*100:.3f}%"}
+                self._logger.info(f"  └─ ✔ 找回并推送成功: {target['name']}")
+                return {"success": True, "message": f"找回成功！精准度: {100-best_diff*100:.1f}%"}
             else:
-                self._logger.warning(f"推送到下载器失败: {target['name']} -> {msg}")
+                self._logger.warning(f"  └─ ⚠ 找回成功但推送到下载器失败: {msg}")
                 return {"success": False, "message": f"推送到下载器失败: {msg}"}
         
+        # 核心修复 3: 正确写入匹配失败状态回 UI 并存储
+        target["status"] = "❌ 匹配失败"
+        target["confidence"] = f"{100-best_diff*100:.1f}%" if best_diff < 1.0 else "0%"
         stats["failed"] += 1
+        
+        self.cache.set("items", items)
         self.cache.set("stats", stats)
+        self._logger.warning(f"  └─ ❌ 匹配失败: 所有站点的结果均被特征/体积校验过滤")
         return {"success": False, "message": "未匹配到体积或特征相符的种子"}
 
     # ==========================
     #  内部辅助方法
     # ==========================
     def _parse_media_name(self, name: str) -> str:
+        # 优化 Title 提取正则，获取最核心片名与年份/季度作为强兜底搜索词
         year_match = re.search(r'[\.\s](19|20)\d{2}[\.\s]', name)
         season_match = re.search(r'[\.\s]S\d{2}[\.\s]', name, re.I)
+        
         split_point = -1
+        suffix = ""
+        
         if year_match: 
             split_point = year_match.start()
+            suffix = year_match.group(0).strip(" .")
         elif season_match: 
             split_point = season_match.start()
+            suffix = season_match.group(0).strip(" .")
             
         if split_point > 0:
             title = name[:split_point].replace(".", " ").strip()
-            suffix = name[split_point:].split(".")[1] if "." in name[split_point:] else ""
+            # 同样清理一次特殊符号
+            title = re.sub(r'[\[\]\(\)\{\}\-\_\￡\@]', ' ', title)
+            title = re.sub(r'\s+', ' ', title).strip()
             return f"{title} {suffix}".strip()
         return ""
 
@@ -622,26 +650,42 @@ class SeedRescuer(_PluginBase):
                 return 999
                 
         sorted_res = sorted(search_results, key=get_priority)
-        core_tags =[w for w in["iQIYI", "MWeb", "Netflix", "NF", "Tencent", "WEB-DL", "BluRay", "REMUX", "HFR"] if w.lower() in local_name.lower()]
+        core_tags =[w for w in["iQIYI", "MWeb", "Netflix", "NF", "Tencent", "WEB-DL", "BluRay", "REMUX", "HFR", "CC"] if w.lower() in local_name.lower()]
+        
+        self._logger.info(f"    └─ 开始特征匹配... 候选数量: {len(sorted_res)} | 本地体积: {self._format_size(target_size)} | 核心要求标签: {core_tags}")
+
+        best_torrent = None
+        best_diff = 1.0
         
         for t in sorted_res:
             t_size = getattr(t, 'size', 0)
             t_title = getattr(t, 'title', getattr(t, 'name', ''))
+            site_name = getattr(t, 'site_name', getattr(t, 'site', 'Unknown'))
             
             if not t_size: 
                 continue
                 
             diff = abs(t_size - target_size) / target_size
-            if diff < 0.001: 
+            if diff < best_diff:
+                best_diff = diff
+
+            # 核心修复 4: 宽容误差上调至 3% (0.03)，防止压制组算错体积或NFO丢失导致的一刀切拒绝
+            if diff <= 0.03: 
                 tag_match = True
                 for tag in core_tags:
                     if tag.lower() not in t_title.lower():
                         tag_match = False
                         break
                 if tag_match: 
+                    self._logger.info(f"    └─ [✅ 完美命中] 站点: {site_name} | 种子: {t_title} | 远程体积: {self._format_size(t_size)} | 误差: {diff*100:.2f}%")
                     return t, diff
+                else:
+                    self._logger.info(f"    └─ [⏭ 跳过] 标签不符: {t_title}")
+            else:
+                self._logger.info(f"    └─[⏭ 跳过] 体积不符: {t_title} (远程体积: {self._format_size(t_size)} | 差距: {diff*100:.2f}%)")
                     
-        return None, 1.0
+        self._logger.info(f"    └─ 无完全匹配项。最小体积误差: {best_diff*100:.2f}%")
+        return None, best_diff
 
     def _download_and_add(self, torrent: Any, local_path: str) -> Tuple[bool, str]:
         if not self._downloader_name:
