@@ -17,9 +17,8 @@ class SeedRescuer(_PluginBase):
     # 插件基本信息
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
-    # 【已修复】使用一个绝对可靠的 GitHub Raw 网络图标链接，避免 Pillow 解析错误
-    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.0.3"
+    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/pt.png"
+    plugin_version = "5.0.4"
     plugin_author = "Gemini"
 
     # 内部变量
@@ -41,6 +40,7 @@ class SeedRescuer(_PluginBase):
         self.sites_helper = SitesHelper()
         self.cache = TTLCache(region="SeedRescuer", maxsize=1000, ttl=86400)
         
+        # 【修复点1】：去掉了带默认值的 cache.get
         if not self.cache.get("stats"):
             self.cache.set("stats", {"total": 0, "rescued": 0, "existing": 0, "failed": 0})
 
@@ -93,7 +93,6 @@ class SeedRescuer(_PluginBase):
     #  前端 UI 定义
     # ==========================
     def get_page(self) -> List[dict]:
-        # 【已修复】全面兼容获取站点的逻辑，安全截获异常
         site_options =[]
         try:
             sites =[]
@@ -103,21 +102,22 @@ class SeedRescuer(_PluginBase):
                 sites = self.sites_helper.get_sites()
                 
             for s in sites:
-                # 兼容字典类型和对象类型
                 s_id = s.get("id") if isinstance(s, dict) else getattr(s, "id", "")
                 s_name = s.get("name") if isinstance(s, dict) else getattr(s, "name", "")
                 if s_id and s_name:
                     site_options.append({"title": s_name, "value": s_id})
-        except Exception as e:
-            pass # 防止此处报错导致页面崩溃
+        except Exception:
+            pass
 
-        # 获取下载器列表（安全处理）
         downloader_options =[]
         try:
             downloaders = self.downloader_helper.get_configs()
             downloader_options =[{"title": name, "value": name} for name in downloaders.keys()]
         except Exception:
             pass
+
+        # 【修复点2】：安全获取缓存，不再使用 cache.get("stats", {})
+        stats = self.cache.get("stats") or {}
 
         return[
             {
@@ -129,10 +129,10 @@ class SeedRescuer(_PluginBase):
                             {
                                 "component": "VRow",
                                 "content":[
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "待找回项目", "subtitle": str(self.cache.get("stats", {}).get("total", 0))}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "成功找回", "subtitle": str(self.cache.get("stats", {}).get("rescued", 0))}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "已在下载器", "subtitle": str(self.cache.get("stats", {}).get("existing", 0))}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "匹配失败", "subtitle": str(self.cache.get("stats", {}).get("failed", 0))}}]}
+                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "待找回项目", "subtitle": str(stats.get("total", 0))}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "成功找回", "subtitle": str(stats.get("rescued", 0))}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "已在下载器", "subtitle": str(stats.get("existing", 0))}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "匹配失败", "subtitle": str(stats.get("failed", 0))}}]}
                                 ]
                             },
                             {
@@ -176,18 +176,19 @@ class SeedRescuer(_PluginBase):
         ]
 
     def get_data(self) -> Dict[str, Any]:
+        # 【修复点3】：使用 or[] 安全回退
         raw_data = self.cache.get("items") or[]
         for item in raw_data:
             item["actions"] =[{"component": "VBtn", "props": {"icon": "mdi-download", "variant": "text", "color": "primary"}, "events": {"click": {"api": "plugin/SeedRescuer/download_item", "method": "post", "data": {"item_id": item["id"]}}}}]
         return {"data_list": raw_data, "stats": self.cache.get("stats")}
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return [
+        return[
             {"path": "/scan_now", "endpoint": self.scan_now, "methods":["GET"]},
             {"path": "/download_item", "endpoint": self.download_item, "methods": ["POST"]},
             {"path": "/download_all", "endpoint": self.download_all, "methods": ["POST"]},
-            {"path": "/test_run", "endpoint": self.test_run, "methods": ["POST"]},
-            {"path": "/reset_history", "endpoint": self.reset_history, "methods": ["POST"]}
+            {"path": "/test_run", "endpoint": self.test_run, "methods":["POST"]},
+            {"path": "/reset_history", "endpoint": self.reset_history, "methods":["POST"]}
         ]
 
     # ==========================
@@ -240,7 +241,10 @@ class SeedRescuer(_PluginBase):
 
     def test_run(self, **kwargs):
         self.scan_now()
-        items =[i for i in self.cache.get("items", []) if "待找回" in i["status"]][:5]
+        # 【修复点4】：避免缓存方法传参数组引起错误
+        cached_items = self.cache.get("items") or[]
+        items =[i for i in cached_items if "待找回" in i.get("status", "")][:5]
+        
         if not items: 
             return {"success": False, "message": "清单中没有待找回的项目"}
 
@@ -253,7 +257,9 @@ class SeedRescuer(_PluginBase):
         return {"success": True, "message": f"已在后台启动灰度测试，将尝试找回 {len(items)} 个项目，请稍后刷新页面查看状态。"}
 
     def download_all(self, **kwargs):
-        to_do =[i for i in self.cache.get("items", []) if "待找回" in i["status"]]
+        cached_items = self.cache.get("items") or []
+        to_do =[i for i in cached_items if "待找回" in i.get("status", "")]
+        
         if not to_do: 
             return {"success": False, "message": "清单中没有待找回的项目，请先执行扫描！"}
 
@@ -267,7 +273,8 @@ class SeedRescuer(_PluginBase):
 
     def download_item(self, item_id: str = None, **kwargs):
         items = self.cache.get("items") or[]
-        stats = self.cache.get("stats")
+        stats = self.cache.get("stats") or {"total": 0, "rescued": 0, "existing": 0, "failed": 0}
+        
         target = next((i for i in items if i["id"] == item_id), None)
         if not target: 
             return {"success": False, "message": "该记录已失效，请重新扫描"}
@@ -351,7 +358,7 @@ class SeedRescuer(_PluginBase):
                                 res.append((item.name, str(item.absolute()), size))
                         else: 
                             scan_recursive(item, depth + 1)
-                    elif item.suffix.lower() in ['.mp4', '.mkv', '.ts', '.iso']:
+                    elif item.suffix.lower() in['.mp4', '.mkv', '.ts', '.iso']:
                         res.append((item.name, str(item.absolute()), item.stat().st_size))
                 except Exception:
                     continue
