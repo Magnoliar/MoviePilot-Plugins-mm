@@ -17,9 +17,8 @@ class SeedRescuer(_PluginBase):
     # 插件基本信息
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
-    # 【已恢复】你的专属图标，且使用正确的 Raw 链接
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.0.5"
+    plugin_version = "5.0.6"
     plugin_author = "Gemini"
 
     # 内部变量
@@ -87,24 +86,24 @@ class SeedRescuer(_PluginBase):
         self._history_file.write_text(json.dumps(history, ensure_ascii=False), encoding='utf-8')
 
     # ==========================
-    # 【彻底修复点】后端配置字典定义
+    # 【彻底修复点】标准后端表单获取
     # ==========================
-    def get_form(self) -> Dict[str, Any]:
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
-        必须返回一个标准字典，供系统底层遍历注册默认配置。
-        不再将其与 V2 的 get_page(UI 组件列表) 混用！
+        向系统返回两项参数：1. 页面UI元素列表  2. 当前已保存的配置数据字典
+        解决解包 (unpack) 报错的终极方案
         """
-        return {
-            "enabled": {"title": "启用定时任务", "type": "bool", "default": False},
-            "cron": {"title": "自动周期", "type": "text", "default": ""},
-            "max_depth": {"title": "扫描深度", "type": "number", "default": 3},
-            "scan_path": {"title": "扫描路径", "type": "text", "default": ""},
-            "path_mapping": {"title": "路径转换", "type": "text", "default": ""},
-            "selected_sites": {"title": "选择站点", "type": "list", "default":[]},
-            "downloader_name": {"title": "下载器", "type": "text", "default": ""},
-            "sleep_min": {"title": "最小延迟(秒)", "type": "number", "default": 3},
-            "sleep_max": {"title": "最大延迟(秒)", "type": "number", "default": 8},
-            "only_paused": {"title": "暂停添加", "type": "bool", "default": True}
+        return self.get_page(), {
+            "enabled": self._enabled,
+            "scan_path": self._scan_path,
+            "selected_sites": self._selected_sites,
+            "downloader_name": self._downloader_name,
+            "cron": self._cron,
+            "only_paused": self._only_paused,
+            "max_depth": self._max_depth,
+            "path_mapping": self._path_mapping,
+            "sleep_min": self._sleep_min,
+            "sleep_max": self._sleep_max
         }
 
     # ==========================
@@ -168,7 +167,7 @@ class SeedRescuer(_PluginBase):
                     },
                     {
                         "title": "清单",
-                        "content": [
+                        "content":[
                             {"component": "VDataTable", "props": {"headers":[{"title": "目录名", "key": "name"}, {"title": "体积", "key": "size_str"}, {"title": "状态", "key": "status"}, {"title": "匹配率", "key": "confidence"}, {"title": "操作", "key": "actions", "sortable": False}], "items": "{{data_list}}"}}
                         ]
                     },
@@ -272,7 +271,7 @@ class SeedRescuer(_PluginBase):
         return {"success": True, "message": f"已在后台启动灰度测试，将尝试找回 {len(items)} 个项目，请稍后刷新页面查看状态。"}
 
     def download_all(self, **kwargs):
-        cached_items = self.cache.get("items") or []
+        cached_items = self.cache.get("items") or[]
         to_do =[i for i in cached_items if "待找回" in i.get("status", "")]
         
         if not to_do: 
@@ -294,7 +293,7 @@ class SeedRescuer(_PluginBase):
         if not target: 
             return {"success": False, "message": "该记录已失效，请重新扫描"}
 
-        search_queries = [
+        search_queries =[
             target["name"].replace(".", " "),
             re.sub(r'\[.*?\]', '', target["name"].replace(".", " ")).strip()
         ]
