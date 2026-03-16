@@ -5,17 +5,14 @@ import json
 import random
 import threading
 import copy
-import base64
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from app.plugins import _PluginBase
 from app.core.config import settings
 from app.helper.downloader import DownloaderHelper
-from app.helper.sites import SitesHelper
 from app.core.cache import TTLCache
 from app.utils.http import RequestUtils
 from app.schemas import NotificationType
@@ -24,18 +21,18 @@ from apscheduler.triggers.cron import CronTrigger
 
 class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
-    plugin_desc = "基于特征扫描智能找回种子。(v5.2.9 绕过全局过滤规则，直调底层爬虫接口)"
+    plugin_desc = "超净版辅种扫描仪。(v6.1.1 TR/QB 全兼容内存直写版)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.3.5"  # 核心升级：废弃可能导致误屏蔽的 SearchChain，直连底层 Indexer 获取绝对原始数据
+    plugin_version = "6.1.1"  # 核心升级：智能探测下载器类型 (TR/QB)，下发对应的底层专属参数组合 (download_dir / labels)
     plugin_author = "Gemini"
     
     auth_level = 1
 
     _enabled = False
     _notify = True
-    _api_token = ""
+    _prowlarr_url = ""  
+    _prowlarr_api = ""
     _scan_path = ""
-    _selected_sites =[]
     _downloader_name = ""
     _cron = ""
     _only_paused = True
@@ -58,7 +55,6 @@ class SeedRescuer(_PluginBase):
         self._setup_logger()
 
         self.downloader_helper = DownloaderHelper()
-        self.sites_helper = SitesHelper()
         self.cache = TTLCache(region="SeedRescuer", maxsize=1000, ttl=86400)
         
         if not self.cache.get("stats"):
@@ -69,9 +65,9 @@ class SeedRescuer(_PluginBase):
         if config:
             self._enabled = config.get("enabled", False)
             self._notify = config.get("notify", True)
-            self._api_token = config.get("api_token", "")
+            self._prowlarr_url = config.get("prowlarr_url", "")
+            self._prowlarr_api = config.get("prowlarr_api", "")
             self._scan_path = config.get("scan_path", "")
-            self._selected_sites = config.get("selected_sites",[])
             self._downloader_name = config.get("downloader_name", "")
             self._cron = config.get("cron", "")
             self._only_paused = config.get("only_paused", True)
@@ -156,36 +152,6 @@ class SeedRescuer(_PluginBase):
             "kwargs": {}
         }]
 
-    # ==========================
-    #  微信/TG 远程控制命令
-    # ==========================
-    @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
-        try:
-            from app.schemas.types import EventType
-            return[{
-                "cmd": "/seed_rescue",
-                "event": EventType.PluginAction,
-                "desc": "全盘扫描并自动化找回种子",
-                "category": "下载器",
-                "data": {"action": "seed_rescue"}
-            }]
-        except ImportError:
-            return[]
-
-    # 这里通过名称直接匹配，防止 EventType 导入失败
-    def on_event(self, event: Any):
-        if hasattr(event, "event_type") and str(event.event_type).endswith("PluginAction"):
-            event_data = getattr(event, "event_data", {})
-            if event_data and event_data.get("action") == "seed_rescue":
-                self._logger.info("收到远程命令，开始在后台执行全量自动化找回...")
-                if self._notify:
-                    self.post_message(channel=event_data.get("channel"),
-                                      title="种子找回助手已启动",
-                                      text="收到远程指令，开始扫描磁盘并全量找回，请稍后查看结果战报。",
-                                      userid=event_data.get("user"))
-                self.download_all()
-
     def _load_history(self) -> Dict[str, bool]:
         if self._history_file.exists():
             try: 
@@ -208,22 +174,6 @@ class SeedRescuer(_PluginBase):
     #  表单页
     # ==========================
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        site_options =[]
-        try:
-            sites =[]
-            if hasattr(self.sites_helper, 'get_indexers'):
-                sites = self.sites_helper.get_indexers()
-            elif hasattr(self.sites_helper, 'get_sites'):
-                sites = self.sites_helper.get_sites()
-                
-            for s in sites:
-                s_id = s.get("id") if isinstance(s, dict) else getattr(s, "id", "")
-                s_name = s.get("name") if isinstance(s, dict) else getattr(s, "name", "")
-                if s_id and s_name:
-                    site_options.append({"title": s_name, "value": s_id})
-        except Exception as e:
-            self._logger.error(f"获取站点列表失败: {e}", exc_info=True)
-
         downloader_options =[]
         try:
             downloaders = self.downloader_helper.get_configs()
@@ -237,21 +187,22 @@ class SeedRescuer(_PluginBase):
                 {
                     "component": "VRow",
                     "content":[
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VSwitch", "props": {"model": "enabled", "label": "启用定时任务", "hint": "开启后根据设定的周期在后台自动执行找回任务。"}}] },
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VTextField", "props": {"model": "cron", "label": "自动周期", "placeholder": "0 2 * * *", "hint": "设置后台全量自动化找回的周期（支持5位 Cron）。"}}] },
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VSwitch", "props": {"model": "notify", "label": "发送通知", "hint": "找回成功及自动化任务结束时发送系统通知。"}}] }
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VSwitch", "props": {"model": "enabled", "label": "启用定时扫描任务", "hint": "开启后根据周期在后台自动执行磁盘与下载器比对扫描。"}}] },
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VTextField", "props": {"model": "cron", "label": "自动周期", "placeholder": "0 2 * * *", "hint": "支持5位 Cron 表达式。"}}] },
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VSwitch", "props": {"model": "notify", "label": "发送通知", "hint": "开启后将在扫描/找回完成时发送通知。"}}] }
                     ]
                 },
                 {
                     "component": "VRow",
                     "content":[
-                        {"component": "VCol", "props": {"cols": 12}, "content":[{"component": "VTextField", "props": {"model": "api_token", "label": "系统 API Token (非必填)", "placeholder": "仅 HTTP 内部兜底调用时需要", "hint": "由于本版本已彻底重构为直调最底层的爬虫模块，该 Token 仅作为最后一道极限容灾的备用手段。"}}] }
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VTextField", "props": {"model": "prowlarr_url", "label": "Prowlarr 检索源 URL (选填)", "placeholder": "http://192.168.1.100:9696", "hint": "若填写，将彻底绕过 MoviePilot 限制，由插件以标准 HTTP 协议直连 Prowlarr 发起自动找回。"}}] },
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VTextField", "props": {"model": "prowlarr_api", "label": "Prowlarr API Key (选填)", "placeholder": "获取自 Prowlarr 设置", "hint": "Prowlarr 的专属 API 密钥。"}}] }
                     ]
                 },
                 {
                     "component": "VRow",
                     "content":[
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VTextField", "props": {"model": "scan_path", "label": "待扫描路径", "placeholder": "/media/movies", "hint": "必填。待找回资源的本地目录，多路径用逗号分隔。"}}] },
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VTextField", "props": {"model": "scan_path", "label": "待扫描路径", "placeholder": "/media/movies", "hint": "必填。待辅种资源的本地目录，多路径用逗号分隔。"}}] },
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VTextField", "props": {"model": "path_mapping", "label": "路径转换映射", "placeholder": "/media:/downloads", "hint": "格式 `容器路径:下载器路径`。"}}] },
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VTextField", "props": {"model": "max_depth", "label": "扫描深度", "type": "number", "hint": "扫描文件层级的最大深度（推荐为3）。"}}] }
                     ]
@@ -259,18 +210,23 @@ class SeedRescuer(_PluginBase):
                 {
                     "component": "VRow",
                     "content":[
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VSelect", "props": {"model": "selected_sites", "label": "目标检索站点", "items": site_options, "multiple": True, "chips": True, "hint": "选择要进行补种/找回的站点，缺省将在所有站点检索。"}}] },
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VSelect", "props": {"model": "downloader_name", "label": "推送下载器", "items": downloader_options, "hint": "推送到哪一个下载器。"}}] }
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VSelect", "props": {"model": "downloader_name", "label": "比对/推送 下载器", "items": downloader_options, "hint": "必须选择！用于比对跳过已有种子，及接收推送。"}}] },
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VTextField", "props": {"model": "sleep_max", "label": "检索最大延迟(秒)", "type": "number", "hint": "Prowlarr 检索请求防封延迟。"}}] },
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VSwitch", "props": {"model": "only_paused", "label": "强行暂停添加", "hint": "推送到下载器后强制暂停状态。"}}] },
+                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VSwitch", "props": {"model": "hide_existing", "label": "过滤已在下载器的资源", "hint": "开启后，将彻底隐藏那些已在下载器中做种的健康资源。"}}] }
                     ]
                 },
                 {
                     "component": "VRow",
-                    "content":[
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VTextField", "props": {"model": "sleep_min", "label": "检索最小延迟(秒)", "type": "number", "hint": "随机等待下限，防止风控。"}}] },
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VTextField", "props": {"model": "sleep_max", "label": "检索最大延迟(秒)", "type": "number", "hint": "随机等待上限。"}}] },
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VSwitch", "props": {"model": "only_paused", "label": "强行暂停添加", "hint": "推送到下载器后强制暂停状态。"}}] },
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VSwitch", "props": {"model": "hide_existing", "label": "过滤已在下载器的资源", "hint": "开启后，100%匹配且已存在于下载器的项目将直接被过滤剔除，不在下方清单内展示。"}}] }
-                    ]
+                    "content":[{
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content":[{
+                            "component": "VAlert",
+                            "props": {"type": "success", "variant": "tonal", "class": "mt-2"},
+                            "text": "🚀 独立引擎已就绪：本插件已彻底剥离系统搜索。若不配置 Prowlarr，插件将作为一个极致纯净的【孤儿种子扫描仪】，提取出绝对路径和片名列表供手工辅种；若配置 Prowlarr，则激活【自动化找回引擎】直接通过内存向 TR/QB 发起协议直写！"
+                        }]
+                    }]
                 }
             ]
         }]
@@ -278,17 +234,17 @@ class SeedRescuer(_PluginBase):
         return elements, {
             "enabled": self._enabled,
             "notify": self._notify,
-            "api_token": self._api_token,
+            "prowlarr_url": self._prowlarr_url,
+            "prowlarr_api": self._prowlarr_api,
             "scan_path": self._scan_path,
-            "selected_sites": self._selected_sites,
             "downloader_name": self._downloader_name,
             "cron": self._cron,
             "only_paused": self._only_paused,
             "hide_existing": self._hide_existing,
             "max_depth": self._max_depth,
             "path_mapping": self._path_mapping,
-            "sleep_min": self._sleep_min,
-            "sleep_max": self._sleep_max
+            "sleep_max": self._sleep_max,
+            "sleep_min": self._sleep_min
         }
 
     # ==========================
@@ -347,10 +303,10 @@ class SeedRescuer(_PluginBase):
             {
                 "component": "VRow",
                 "content":[
-                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "待找回项目", "subtitle": str(stats.get("total", 0))}}] },
-                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "成功找回", "subtitle": str(stats.get("rescued", 0))}}] },
-                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "已在下载器", "subtitle": str(stats.get("existing", 0))}}] },
-                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "匹配失败", "subtitle": str(stats.get("failed", 0))}}] }
+                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "盘内资源总计", "subtitle": str(stats.get("total", 0))}}] },
+                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "成功辅种/找回", "subtitle": str(stats.get("rescued", 0))}}] },
+                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "健康做种中", "subtitle": str(stats.get("existing", 0))}}] },
+                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "需手动辅种", "subtitle": str(stats.get("failed", 0))}}] }
                 ]
             },
             {
@@ -358,16 +314,16 @@ class SeedRescuer(_PluginBase):
                 "props": {"class": "mt-4 mb-4"},
                 "content":[
                     {"component": "VCol", "content":[
-                        {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-magnify"}, "text": "扫描磁盘", "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
+                        {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-magnify"}, "text": "全盘扫描", "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
                         {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-test-tube"}, "text": "灰度测试", "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "get"}}},
-                        {"component": "VBtn", "props": {"color": "success", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-rocket"}, "text": "全量找回", "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "get"}}},
+                        {"component": "VBtn", "props": {"color": "success", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-rocket"}, "text": "全量自动找回", "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "get"}}},
                         {"component": "VBtn", "props": {"color": "error", "variant": "tonal", "class": "mb-2", "prepend-icon": "mdi-delete"}, "text": "重置记录", "events": {"click": {"api": "plugin/SeedRescuer/reset_history", "method": "get"}}}
                     ]}
                 ]
             },
             {
                 "component": "VCard",
-                "props": {"title": "找回清单"},
+                "props": {"title": "孤儿种子与辅助清单"},
                 "content":[
                     {
                         "component": "VTable",
@@ -378,11 +334,11 @@ class SeedRescuer(_PluginBase):
                                 "content":[{
                                     "component": "tr",
                                     "content":[
-                                        {"component": "th", "text": "项目详情 (带路径)"},
-                                        {"component": "th", "text": "体积"},
-                                        {"component": "th", "text": "状态"},
-                                        {"component": "th", "text": "匹配率"},
-                                        {"component": "th", "text": "操作"}
+                                        {"component": "th", "text": "项目详情 (包含底层绝对路径)"},
+                                        {"component": "th", "text": "精准体积"},
+                                        {"component": "th", "text": "辅种状态"},
+                                        {"component": "th", "text": "自动匹配率"},
+                                        {"component": "th", "text": "自动化"}
                                     ]
                                 }]
                             },
@@ -396,7 +352,7 @@ class SeedRescuer(_PluginBase):
             },
             {
                 "component": "VCard",
-                "props": {"title": "待处理片名清单 (可直接 Ctrl+C 复制手动搜种)", "class": "mt-6", "variant": "outlined", "color": "warning"},
+                "props": {"title": "待处理片名提取区 (供手工去 PT 站检索，复制后手动推给 qBittorrent)", "class": "mt-6", "variant": "outlined", "color": "warning"},
                 "content":[
                     {
                         "component": "VTextarea",
@@ -415,10 +371,10 @@ class SeedRescuer(_PluginBase):
     def get_data(self) -> Dict[str, Any]:
         data_list = self.cache.get("items") or[]
         
-        failed_names = [item['name'] for item in data_list if item.get("status") in["⏳ 待找回", "❌ 匹配失败"]]
+        failed_names = [item['name'] for item in data_list if item.get("status") in["⏳ 待找回", "❌ 匹配失败", "❌ 需手动辅种"]]
         failed_list_text = "\n".join(failed_names)
         if not failed_list_text:
-            failed_list_text = "✨ 太棒了！目前没有任何待找回或匹配失败的项目。"
+            failed_list_text = "✨ 太棒了！硬盘扫描完毕，目前没有任何待辅种的孤儿文件夹。"
             
         try:
             list_file_path = Path(getattr(settings, "LOG_PATH", "/moviepilot/logs")) / "plugins" / "seedrescuer_list.txt"
@@ -455,7 +411,7 @@ class SeedRescuer(_PluginBase):
             return {"success": False, "message": "已有后台任务正在运行，请稍候..."}
             
         try:
-            self.cache.set("status_msg", "正在全盘扫描，请稍候...")
+            self.cache.set("status_msg", "正在全盘精细扫描，提取孤儿文件夹...")
             if not self._scan_path: 
                 self.cache.set("status_msg", "扫描中止: 未配置扫描路径")
                 return {"success": False, "message": "未配置扫描路径，请先在底角⚙️设置中配置。"}
@@ -520,7 +476,7 @@ class SeedRescuer(_PluginBase):
         try:
             self.scan_now()
             cached_items = self.cache.get("items") or []
-            items =[i for i in cached_items if "待找回" in i.get("status", "")] [:5]
+            items =[i for i in cached_items if "待找回" in i.get("status", "")][:5]
             
             if not items: 
                 self.cache.set("status_msg", "空闲中 (清单为空)")
@@ -579,7 +535,7 @@ class SeedRescuer(_PluginBase):
                     time.sleep(random.uniform(self._sleep_min, self._sleep_max))
                     
                 self.cache.set("status_msg", "空闲中 (全量找回任务结束)")
-                self._send_notify("全量自动化找回结束", f"全量自动化找回计划执行完毕。共处理 {len(to_do)} 个找回项，成功找回 {success_count} 个。")
+                self._send_notify("全量自动化找回结束", f"全量自动化找回计划执行完毕。共处理 {len(to_do)} 个孤儿项，自动找回 {success_count} 个。")
                 self._logger.info("全量自动化找回运行结束")
                     
             threading.Thread(target=run_all_background, daemon=True).start()
@@ -587,100 +543,33 @@ class SeedRescuer(_PluginBase):
         finally:
             self._task_lock.release()
 
-    # 核心重构：抛弃可能携带屏蔽规则的 SearchChain，直接通过底层的 Indexer 获取纯净的 Raw 数据
-    def _search_torrents(self, query: str, site_ids: list = None) -> List[Any]:
-        results = None
-        mediainfo = None
-
-        # 1. 尝试将目录名转换为带 TMDb 信息的规范化对象，提高爬虫检索命准率
-        try:
-            from app.core.metainfo import MetaInfo
-            meta = MetaInfo(title=query)
-            mediainfo = self.chain.recognize_media(meta=meta)
-            if mediainfo:
-                self._logger.info(f"  ├─ 媒体识别成功: {mediainfo.title_year}")
-        except Exception as e:
-            self._logger.debug(f"媒体识别异常(降级纯关键字匹配): {e}")
-
-        # 2. 核心：直接调用 Indexer，它不受全局质量、压制组过滤规则的影响，返回所有原始结果
-        if results is None:
-            try:
-                from app.modules.indexer import Indexer
-                indexer = Indexer()
-                try:
-                    res = indexer.search_torrents(mediainfo=mediainfo, keyword=query)
-                except TypeError:
-                    try:
-                        res = indexer.search_torrents(keyword=query)
-                    except TypeError:
-                        res = indexer.search_torrents(title=query)
-                if res: results = res
-            except Exception as e:
-                self._logger.warning(f"容灾1 (Indexer直通) 调用失败: {e}", exc_info=True)
-
-        # 3. 旧版兼容容灾：SitesHelper
-        if results is None and hasattr(self.sites_helper, 'search'):
-            try:
-                res = self.sites_helper.search(keyword=query)
-                if res: results = res
-            except Exception as e:
-                self._logger.warning(f"容灾2 (SitesHelper) 调用失败: {e}", exc_info=True)
-
-        # 4. HTTP 直接请求兜底 (如果前面模块因为系统大改版被删除)
-        if results is None:
-            try:
-                token = self._api_token or getattr(settings, "API_TOKEN", "")
-                if not token:
-                    try:
-                        from app.db.systemconfig_oper import SystemConfigOper
-                        token = SystemConfigOper().get("api_token")
-                    except Exception:
-                        pass
-                        
-                port = getattr(settings, "PORT", 3000)
-                if token:
-                    headers = {"Authorization": f"Bearer {token}"}
-                    params = {"keyword": query, "token": token}
-                    
-                    res = RequestUtils().get_res(
-                        f"http://127.0.0.1:{port}/api/v1/search/title", 
-                        params=params,
-                        headers=headers
-                    )
-                    if res and res.status_code == 200:
-                        data = res.json()
-                        if isinstance(data, list):
-                            results = data
-                        elif isinstance(data, dict) and 'data' in data:
-                            results = data['data']
-            except Exception as e:
-                self._logger.warning(f"容灾3 (HTTP兜底) 请求异常: {e}", exc_info=True)
-
-        if results is None:
-            self._logger.error("  ├─ ❌ 致命错误: 系统未开放任何无过滤的搜索 API 接口，所有容灾链路调用均告失败！")
+    def _search_prowlarr(self, query: str) -> List[dict]:
+        if not self._prowlarr_url or not self._prowlarr_api:
             return[]
             
-        valid_results =[]
-        for t in results:
-            if hasattr(t, 'torrent_info'):
-                valid_results.append(t.torrent_info)
+        try:
+            url = f"{self._prowlarr_url.rstrip('/')}/api/v1/search"
+            headers = {"X-Api-Key": self._prowlarr_api}
+            params = {"query": query}
+            
+            res = RequestUtils().get_res(url, headers=headers, params=params)
+            if res and res.status_code == 200:
+                data = res.json()
+                results =[]
+                for item in data:
+                    results.append({
+                        "title": item.get("title", ""),
+                        "size": item.get("size", 0),
+                        "enclosure": item.get("downloadUrl", ""),
+                        "site_name": item.get("indexer", "Prowlarr")
+                    })
+                return results
             else:
-                valid_results.append(t)
-                
-        # 基于你在设置页选的白名单，进行本地过滤
-        if site_ids:
-            filtered =[]
-            for t in valid_results:
-                if isinstance(t, dict):
-                    t_site = str(t.get('site') or t.get('site_id', ''))
-                else:
-                    t_site = str(getattr(t, 'site', getattr(t, 'site_id', '')))
-                    
-                if t_site in map(str, site_ids):
-                    filtered.append(t)
-            return filtered
-
-        return valid_results
+                self._logger.warning(f"  ├─ ⚠ Prowlarr 响应异常，HTTP 状态码: {res.status_code if res else 'None'}")
+        except Exception as e:
+            self._logger.error(f"  ├─ ❌ 连接 Prowlarr 失败: {e}", exc_info=True)
+            
+        return[]
 
     def download_item(self, item_id: str):
         if not item_id:
@@ -693,7 +582,16 @@ class SeedRescuer(_PluginBase):
         if not target: 
             return {"success": False, "message": "该记录已失效，请重新扫描"}
 
-        self._logger.info(f"▶ 开始尝试找回:[{target['name']}] (原始体积: {self._format_size(target['size'])})")
+        self._logger.info(f"▶ 开始尝试处理: [{target['name']}] (原始精准体积: {self._format_size(target['size'])})")
+
+        if not self._prowlarr_url or not self._prowlarr_api:
+            target["status"] = "❌ 需手动辅种"
+            target["confidence"] = "-"
+            stats["failed"] += 1
+            self.cache.set("items", items)
+            self.cache.set("stats", stats)
+            self._logger.info(f"  └─ 🚫 Prowlarr 检索未配置。保留本地绝对路径供手工去下载器粘贴补种。")
+            return {"success": False, "message": "未配置 Prowlarr 直连引擎，自动化找回已禁用。请复制界面左侧提供的绝对路径手工添加种子！"}
 
         clean_name = re.sub(r'[\[\]\(\)\{\}\-\_\￡\@]', ' ', target["name"]).replace(".", " ")
         clean_name = re.sub(r'\s+', ' ', clean_name).strip()
@@ -707,7 +605,7 @@ class SeedRescuer(_PluginBase):
             search_queries.append(clean_title)
 
         search_queries = list(dict.fromkeys(search_queries))
-        self._logger.info(f"  ├─ 生成检索关键词: {search_queries}")
+        self._logger.info(f"  ├─ 剥离干扰符号生成检索池: {search_queries}")
 
         best_torrent = None
         best_diff = 1.0
@@ -715,16 +613,16 @@ class SeedRescuer(_PluginBase):
         for query in search_queries: 
             if not query: continue
             try:
-                self._logger.info(f"  ├─ 发起搜索: '{query}'")
-                results = self._search_torrents(query, self._selected_sites)
-                self._logger.info(f"  ├─ 收到结果: {len(results) if results else 0} 条，进入二次校验...")
+                self._logger.info(f"  ├─ 直连 Prowlarr 引擎发起纯净搜索: '{query}'")
+                results = self._search_prowlarr(query)
+                self._logger.info(f"  ├─ Prowlarr 极速返回无过滤 Raw 数据: {len(results)} 条，进入底层比对器...")
                 
                 if results:
                     best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
                     if best_torrent: 
                         break 
             except Exception as e:
-                self._logger.error(f"  ├─ 站点搜索或匹配时发生异常 [{query}]: {e}", exc_info=True)
+                self._logger.error(f"  ├─ 引擎搜索或内部计算崩溃 [{query}]: {e}", exc_info=True)
 
         if best_torrent:
             success, msg = self._download_and_add(best_torrent, target["path"])
@@ -736,20 +634,20 @@ class SeedRescuer(_PluginBase):
                 
                 self.cache.set("items", items)
                 self.cache.set("stats", stats)
-                self._logger.info(f"  └─ ✔ 找回并推送成功: {target['name']}")
-                return {"success": True, "message": f"找回成功！精准度: {100-best_diff*100:.1f}%"}
+                self._logger.info(f"  └─ ✔ 直写下载器成功: {target['name']}")
+                return {"success": True, "message": f"找回成功！体积匹配度: {100-best_diff*100:.1f}%"}
             else:
-                self._logger.warning(f"  └─ ⚠ 找回成功但推送到下载器失败: {msg}")
-                return {"success": False, "message": f"推送到下载器失败: {msg}"}
+                self._logger.warning(f"  └─ ⚠ 种子匹配成功但直写被拒: {msg}")
+                return {"success": False, "message": f"直写下载器被拒: {msg}"}
         
-        target["status"] = "❌ 匹配失败"
+        target["status"] = "❌ 需手动辅种"
         target["confidence"] = f"{100-best_diff*100:.1f}%" if best_diff < 1.0 else "0%"
         stats["failed"] += 1
         
         self.cache.set("items", items)
         self.cache.set("stats", stats)
-        self._logger.warning(f"  └─ ❌ 匹配失败: 所有站点的结果均被特征/体积校验过滤，未命中符合要求的种子。")
-        return {"success": False, "message": "未匹配到体积或特征相符的种子"}
+        self._logger.warning(f"  └─ ❌ 匹配失败: 当前 Prowlarr 返回结果池中无可容忍误差内的匹配项，建议手工辅助。")
+        return {"success": False, "message": "Prowlarr 结果池中无体积相符的种子。"}
 
     # ==========================
     #  内部辅助方法
@@ -823,40 +721,24 @@ class SeedRescuer(_PluginBase):
                         if t_name:
                             names.add(t_name)
             except Exception as e:
-                self._logger.warning(f"获取下载器当前种子状态时出现问题: {e}")
+                self._logger.warning(f"连接下载器比对时出错: {e}")
         return names
 
-    def _match_torrent(self, search_results: List[Any], target_size: int, local_name: str) -> Tuple[Optional[Any], float]:
+    def _match_torrent(self, search_results: List[dict], target_size: int, local_name: str) -> Tuple[Optional[dict], float]:
         if not search_results: 
             return None, 1.0
-            
-        def get_priority(t):
-            if isinstance(t, dict):
-                site_id = t.get('site') or t.get('site_id', '')
-            else:
-                site_id = getattr(t, 'site', getattr(t, 'site_id', ''))
-            try: 
-                return self._selected_sites.index(str(site_id))
-            except Exception: 
-                return 999
                 
-        sorted_res = sorted(search_results, key=get_priority)
         core_tags =[w for w in["iQIYI", "MWeb", "Netflix", "NF", "Tencent", "WEB-DL", "BluRay", "REMUX", "HFR", "CC"] if w.lower() in local_name.lower()]
         
-        self._logger.info(f"    └─ 开始特征匹配... 候选数量: {len(sorted_res)} | 本地体积: {self._format_size(target_size)} | 核心要求标签: {core_tags}")
+        self._logger.info(f"    └─ Prowlarr 数据流清洗... 候选数量: {len(search_results)} | 目标精准体积: {self._format_size(target_size)}")
 
         best_torrent = None
         best_diff = 1.0
         
-        for t in sorted_res:
-            if isinstance(t, dict):
-                t_size = t.get('size', 0)
-                t_title = t.get('title') or t.get('name', '')
-                site_name = t.get('site_name') or t.get('site', 'Unknown')
-            else:
-                t_size = getattr(t, 'size', 0)
-                t_title = getattr(t, 'title', getattr(t, 'name', ''))
-                site_name = getattr(t, 'site_name', getattr(t, 'site', 'Unknown'))
+        for t in search_results:
+            t_size = t.get('size', 0)
+            t_title = t.get('title', '')
+            site_name = t.get('site_name', 'Prowlarr')
             
             if not t_size: 
                 continue
@@ -872,82 +754,71 @@ class SeedRescuer(_PluginBase):
                         tag_match = False
                         break
                 if tag_match: 
-                    self._logger.info(f"    └─ [✅ 完美命中] 站点: {site_name} | 种子: {t_title} | 远程体积: {self._format_size(t_size)} | 误差: {diff*100:.2f}%")
+                    self._logger.info(f"    └─[✅ 匹配器锁定] 数据源: {site_name} | Torrent源名称: {t_title} | Torrent源体积: {self._format_size(t_size)} | 误差: {diff*100:.2f}%")
                     return t, diff
                 else:
-                    self._logger.info(f"    └─ [⏭ 跳过] 标签不符: {t_title}")
+                    self._logger.info(f"    └─[⏭ 跳过] 高危特征不符: {t_title}")
             else:
-                self._logger.info(f"    └─ [⏭ 跳过] 体积不符: {t_title} (远程体积: {self._format_size(t_size)} | 差距: {diff*100:.2f}%)")
+                self._logger.info(f"    └─[⏭ 跳过] 致命体积不符: {t_title} (Torrent体积: {self._format_size(t_size)} | 差距达: {diff*100:.2f}%)")
                     
-        self._logger.info(f"    └─ 无完全匹配项。最小体积误差: {best_diff*100:.2f}%")
+        self._logger.info(f"    └─ 未找到绝对吻合的资源。本批次最小体积差距为: {best_diff*100:.2f}%")
         return None, best_diff
 
-    def _resolve_base64_url(self, url: str) -> str:
-        if not url or not url.startswith("["): 
-            return url
-        try:
-            m = re.search(r"\[(.*)](.*)", url)
-            if m:
-                base64_str = m.group(1)
-                req_str = base64.b64decode(base64_str.encode('utf-8')).decode('utf-8')
-                req_params = json.loads(req_str)
-                res = RequestUtils().get_res(m.group(2), params=req_params.get('params'))
-                if res and req_params.get('result'):
-                    data = res.json()
-                    for key in str(req_params.get('result')).split("."):
-                        data = data.get(key)
-                    return data if data else url
-                elif res:
-                    return res.text
-        except Exception as e:
-            self._logger.warning(f"尝试解析 base64 代理链接发生异常: {e}")
-        return url
-
-    def _resolve_nexusphp_letdown(self, url: str) -> str:
-        if not url or url.startswith("magnet"): 
-            return url
-        try:
-            parsed_url = urlparse(url)
-            query_params = dict(parse_qsl(parsed_url.query))
-            query_params["letdown"] = "1"
-            new_query = urlencode(query_params)
-            return str(urlunparse(parsed_url._replace(query=new_query)))
-        except Exception:
-            return url
-
-    def _download_and_add(self, torrent: Any, local_path: str) -> Tuple[bool, str]:
+    # 核心降维打击：智能分辨 TR 与 QB，并将种子字节流强行喂给底层接口！
+    def _download_and_add(self, torrent: dict, local_path: str) -> Tuple[bool, str]:
         downloader = self.downloader
         if not downloader: 
-            return False, "选定下载器配置不存在或服务未连接"
+            return False, "选定下载器配置不存在或服务离线"
             
-        save_path = str(Path(local_path).parent).replace("\\", "/")
+        save_dir = str(Path(local_path).parent).replace("\\", "/")
         
         if self._path_mapping and ":" in self._path_mapping:
             internal, external = self._path_mapping.split(":", 1)
             internal = internal.replace("\\", "/")
             external = external.replace("\\", "/")
-            if save_path.startswith(internal):
-                save_path = external + save_path[len(internal):]
+            if save_dir.startswith(internal):
+                save_dir = external + save_dir[len(internal):]
 
-        if isinstance(torrent, dict):
-            torrent_url = torrent.get('enclosure') or torrent.get('url', '')
-        else:
-            torrent_url = getattr(torrent, 'enclosure', getattr(torrent, 'url', ''))
-        
-        torrent_url = self._resolve_base64_url(torrent_url)
-        torrent_url = self._resolve_nexusphp_letdown(torrent_url)
-        
+        torrent_url = torrent.get('enclosure', '')
+        torrent_content = None
+
+        if self._prowlarr_url and self._prowlarr_api and torrent_url.startswith('http'):
+            try:
+                headers = {"X-Api-Key": self._prowlarr_api}
+                res = RequestUtils().get_res(torrent_url, headers=headers)
+                if res and res.status_code == 200 and res.content:
+                    torrent_content = res.content
+                    self._logger.info("  ├─ 🚀 已成功利用 Prowlarr 引擎将真实的 .torrent 种子文件流拉取至系统内存")
+                else:
+                    self._logger.warning(f"  ├─ ⚠ 从 Prowlarr 拉取种子文件流失败，状态码: {res.status_code if res else 'None'}")
+            except Exception as e:
+                self._logger.error(f"  ├─ ❌ Prowlarr 文件流拉取异常: {e}")
+
+        is_qb = self.downloader_helper.is_downloader("qbittorrent", service=self.service_info)
+        is_tr = self.downloader_helper.is_downloader("transmission", service=self.service_info)
+
         try:
-            res = downloader.add_torrent(
-                torrent_url=torrent_url, 
-                save_path=save_path.rstrip("/"), 
-                is_paused=self._only_paused, 
-                tag="SeedRescuer"
-            )
+            # 智能构造针对不同下载器的底层参数字典 (TR 只能接受 download_dir 和 labels，QB 接收 tag)
+            add_kwargs = {
+                "download_dir": save_dir.rstrip("/"),
+                "is_paused": self._only_paused
+            }
+            if torrent_content:
+                add_kwargs["content"] = torrent_content
+            else:
+                add_kwargs["torrent_url"] = torrent_url
+                
+            if is_qb:
+                add_kwargs["tag"] = ["SeedRescuer"]
+            elif is_tr:
+                add_kwargs["labels"] = ["SeedRescuer"]
+                
+            # 直写：此时由于绕过了所有的上层链，下载器内部将只执行最基础的接受动作，不会触发任何后置整理或重命名！
+            res = downloader.add_torrent(**add_kwargs)
             success = res[0] if isinstance(res, tuple) else bool(res)
-            return success, ("添加成功" if success else "下载器拒绝接受任务")
+            return success, ("内存直写成功" if success else "下载器底层协议拒载")
         except Exception as e:
-            self._logger.error(f"种子提交到下载器时发生异常: {e}", exc_info=True)
+            self._logger.error(f"指令下发到底层下载器时遇到阻断: {e}", exc_info=True)
             return False, str(e)
 
     def _format_size(self, size: int) -> str:
