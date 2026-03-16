@@ -17,7 +17,7 @@ class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "3.8"
+    plugin_version = "3.9" # 提升版本号
     plugin_author = "Gemini"
 
     # 内部变量
