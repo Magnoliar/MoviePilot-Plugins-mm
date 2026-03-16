@@ -17,7 +17,7 @@ class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "3.7"
+    plugin_version = "3.8"
     plugin_author = "Gemini"
 
     # 内部变量
@@ -88,7 +88,8 @@ class SeedRescuer(_PluginBase):
                                 ]
                             },
                             {
-                                "component": "VRow", props={"class": "mt-2"},
+                                "component": "VRow",
+                                "props": {"class": "mt-2"},
                                 "content": [
                                     {"component": "VCol", "content": [
                                         {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-2"}, "content": "🔍 扫描磁盘", "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
@@ -174,13 +175,9 @@ class SeedRescuer(_PluginBase):
         target = next((i for i in items if i["id"] == item_id), None)
         if not target: return {"code": 1, "message": "项目失效"}
 
-        # 核心识别与搜索逻辑：完全解耦 MoviePilot 内部 IdentifyChain
         search_queries = []
-        # 1. 原始全特征名 (最精准)
         search_queries.append(target["name"].replace(".", " "))
-        # 2. 去中括号名 (过滤组标签)
         search_queries.append(re.sub(r'\[.*?\]', '', target["name"].replace(".", " ")).strip())
-        # 3. 智能正则解析提取 (标题+年份) - 代替原 IdentifyChain 逻辑
         clean_title = self._parse_media_name(target["name"])
         if clean_title:
             search_queries.append(clean_title)
@@ -206,32 +203,21 @@ class SeedRescuer(_PluginBase):
         return {"code": 1, "message": "未匹配到完全一致的种子"}
 
     def _parse_media_name(self, name: str) -> str:
-        """
-        内置 PT 命名解析逻辑，无需依赖外部 Chain
-        提取 标题 + 年份 或 标题 + Sxx
-        """
-        # 匹配年份 (19xx/20xx)
         year_match = re.search(r'[\.\s](19|20)\d{2}[\.\s]', name)
-        # 匹配季号 (S01-99)
         season_match = re.search(r'[\.\s]S\d{2}[\.\s]', name, re.I)
-        
-        # 寻找切分点
         split_point = -1
         if year_match: split_point = year_match.start()
         elif season_match: split_point = season_match.start()
-        
         if split_point > 0:
             title = name[:split_point].replace(".", " ").strip()
             suffix = name[split_point:].split(".")[1] if "." in name[split_point:] else ""
             return f"{title} {suffix}".strip()
-        
         return ""
 
     def test_run(self, **kwargs):
         self.scan_now()
         items = [i for i in self.cache.get("items", []) if "待处理" in i["status"]][:5]
         if not items: return {"code": 1, "message": "无可测试项"}
-        
         count = 0
         for item in items: 
             res = self.download_item(item_id=item["id"])
@@ -239,7 +225,6 @@ class SeedRescuer(_PluginBase):
             delay = random.uniform(self._sleep_min, self._sleep_max)
             self.info(f"防风控睡眠: 等待 {delay:.1f} 秒...")
             time.sleep(delay)
-            
         return {"code": 0, "message": f"测试完成，成功 {count}/5 个，请检查 TR 状态"}
 
     def download_all(self, **kwargs):
@@ -252,7 +237,6 @@ class SeedRescuer(_PluginBase):
             delay = random.uniform(self._sleep_min, self._sleep_max)
             self.info(f"防风控睡眠: 等待 {delay:.1f} 秒...")
             time.sleep(delay)
-            
         self.post_message(mtype=NotificationType.DownloadAdded, title="找回任务完成", text=f"成功为 {len(to_do)} 个资源找回了种子。")
         return {"code": 0, "message": "全量任务已完成"}
 
@@ -261,7 +245,6 @@ class SeedRescuer(_PluginBase):
         root = Path(scan_path)
         if not root.exists(): return res
         feature_pattern = re.compile(r'\d{4}|S\d{2}|1080p|2160p|WEB-DL|BluRay|REMUX', re.I)
-        
         def scan_recursive(current_path: Path, depth: int):
             if depth > self._max_depth: return
             try:
@@ -288,26 +271,21 @@ class SeedRescuer(_PluginBase):
 
     def _match_torrent(self, search_results: List[Any], target_size: int, local_name: str) -> Tuple[Optional[Dict], float]:
         if not search_results: return None, 1.0
-        
         def get_priority(t):
             try: return self._selected_sites.index(t.get('site_id'))
             except: return 999
-        
         sorted_res = sorted(search_results, key=get_priority)
         core_tags = [w for w in ["iQIYI", "MWeb", "Netflix", "NF", "Tencent", "WEB-DL", "BluRay", "REMUX", "HFR"] if w.lower() in local_name.lower()]
-
         for t in sorted_res:
             t_size = t.get('size')
             t_title = t.get('title', '')
             if not t_size: continue
-            
             diff = abs(t_size - target_size) / target_size
             if diff < 0.001: 
                 tag_match = True
                 for tag in core_tags:
                     if tag.lower() not in t_title.lower():
                         tag_match = False; break
-                
                 if tag_match:
                     self.info(f"极致匹配成功！误差: {diff:.6%}, 标签校验通过: {core_tags}")
                     return t, diff
