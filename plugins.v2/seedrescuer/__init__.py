@@ -17,7 +17,7 @@ class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "4.0"
+    plugin_version = "5.0"
     plugin_author = "Gemini"
 
     # 内部变量
@@ -54,18 +54,15 @@ class SeedRescuer(_PluginBase):
             self._sleep_min = int(config.get("sleep_min", 3))
             self._sleep_max = int(config.get("sleep_max", 8))
 
-    # --- 必须实现的抽象方法补全 ---
+    # --- 显式补全基类所有可能的抽象方法 ---
 
     def get_state(self) -> bool:
-        """返回插件运行状态"""
         return self._enabled
 
     def get_form(self) -> List[dict]:
-        """MoviePilot 部分版本调用此方法获取配置表单"""
         return self.get_page()
 
     def stop_service(self):
-        """停止插件服务逻辑"""
         pass
 
     # ---------------------------
@@ -92,15 +89,15 @@ class SeedRescuer(_PluginBase):
                 "component": "VTabs",
                 "content": [
                     {
-                        "title": "概览与操作",
+                        "title": "概览",
                         "content": [
                             {
                                 "component": "VRow",
                                 "content": [
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCard", "props": {"title": "待找回项目", "subtitle": "{{stats.total}}", "prepend-icon": "mdi-folder-search", "color": "blue-lighten-4"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCard", "props": {"title": "成功找回", "subtitle": "{{stats.rescued}}", "prepend-icon": "mdi-check-decagram", "color": "green-lighten-4"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCard", "props": {"title": "已在下载器", "subtitle": "{{stats.existing}}", "prepend-icon": "mdi-cloud-check", "color": "orange-lighten-4"}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCard", "props": {"title": "匹配失败", "subtitle": "{{stats.failed}}", "prepend-icon": "mdi-close-circle", "color": "red-lighten-4"}}]}
+                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCard", "props": {"title": "待找回项目", "subtitle": str(self.cache.get("stats", {}).get("total", 0))}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCard", "props": {"title": "成功找回", "subtitle": str(self.cache.get("stats", {}).get("rescued", 0))}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCard", "props": {"title": "已在下载器", "subtitle": str(self.cache.get("stats", {}).get("existing", 0))}}]},
+                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [{"component": "VCard", "props": {"title": "匹配失败", "subtitle": str(self.cache.get("stats", {}).get("failed", 0))}}]}
                                 ]
                             },
                             {
@@ -110,17 +107,17 @@ class SeedRescuer(_PluginBase):
                                     {"component": "VCol", "content": [
                                         {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-2"}, "content": "🔍 扫描磁盘", "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
                                         {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-2"}, "content": "🧪 灰度测试 (5项)", "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "post"}}},
-                                        {"component": "VBtn", "props": {"color": "success", "variant": "tonal"}, "content": "🚀 全量全自动找回", "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "post"}}},
+                                        {"component": "VBtn", "props": {"color": "success", "variant": "tonal"}, "content": "🚀 全量找回", "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "post"}}},
                                     ]}
                                 ]
                             },
-                            {"component": "VBtn", "props": {"color": "grey", "variant": "text", "class": "mt-4"}, "content": "重置历史记录", "events": {"click": {"api": "plugin/SeedRescuer/reset_history", "method": "post"}}}
+                            {"component": "VBtn", "props": {"color": "grey", "variant": "text", "class": "mt-4"}, "content": "重置记录", "events": {"click": {"api": "plugin/SeedRescuer/reset_history", "method": "post"}}}
                         ]
                     },
                     {
-                        "title": "待找回清单",
+                        "title": "清单",
                         "content": [
-                            {"component": "VDataTable", "props": {"headers": [{"title": "本地目录名", "key": "name"}, {"title": "体积", "key": "size_str"}, {"title": "找回状态", "key": "status"}, {"title": "匹配率", "key": "confidence"}, {"title": "操作", "key": "actions", "sortable": False}], "items": "{{data_list}}"}}
+                            {"component": "VDataTable", "props": {"headers": [{"title": "目录名", "key": "name"}, {"title": "体积", "key": "size_str"}, {"title": "状态", "key": "status"}, {"title": "匹配率", "key": "confidence"}, {"title": "操作", "key": "actions", "sortable": False}], "items": "{{data_list}}"}}
                         ]
                     },
                     {
@@ -131,10 +128,10 @@ class SeedRescuer(_PluginBase):
                                 "content": [
                                     {"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VSwitch", "props": {"model": "enabled", "label": "启用定时任务"}}]}, {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "cron", "label": "自动周期", "placeholder": "0 2 * * *"}}, ]}, {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [{"component": "VTextField", "props": {"model": "max_depth", "label": "扫描深度", "type": "number"}}]}]},
                                     {"component": "VTextField", "props": {"model": "scan_path", "label": "扫描路径 (逗号分隔)", "placeholder": "/media/movies"}},
-                                    {"component": "VTextField", "props": {"model": "path_mapping", "label": "路径转换 (内部:TR)", "placeholder": "/media:/downloads", "hint": "将MoviePilot识别路径转换为下载器路径"}},
-                                    {"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSelect", "props": {"model": "selected_sites", "label": "选择站点", "items": site_options, "multiple": True, "chips": True}}]}, {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSelect", "props": {"model": "downloader_name", "label": "目标下载器", "items": downloader_options}}]}]},
-                                    {"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "sleep_min", "label": "最小请求间隔(秒)", "type": "number", "hint": "防止触发站点风控"}}]}, {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "sleep_max", "label": "最大请求间隔(秒)", "type": "number"}}]}]},
-                                    {"component": "VSwitch", "props": {"model": "only_paused", "label": "暂停添加 (推荐，确保校验)"}}
+                                    {"component": "VTextField", "props": {"model": "path_mapping", "label": "路径转换", "placeholder": "/media:/downloads"}},
+                                    {"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSelect", "props": {"model": "selected_sites", "label": "选择站点", "items": site_options, "multiple": True, "chips": True}}]}, {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VSelect", "props": {"model": "downloader_name", "label": "下载器", "items": downloader_options}}]}]},
+                                    {"component": "VRow", "content": [{"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "sleep_min", "label": "最小延迟(秒)", "type": "number"}}]}, {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [{"component": "VTextField", "props": {"model": "sleep_max", "label": "最大延迟(秒)", "type": "number"}}]}]},
+                                    {"component": "VSwitch", "props": {"model": "only_paused", "label": "暂停添加"}}
                                 ]
                             }
                         ]
@@ -163,7 +160,7 @@ class SeedRescuer(_PluginBase):
         return {"code": 0, "message": "历史已重置"}
 
     def scan_now(self, **kwargs):
-        if not self._scan_path: return {"code": 1, "message": "请配置路径"}
+        if not self._scan_path: return {"code": 1, "message": "未配置路径"}
         all_items = []
         history = self._load_history()
         existing_torrents = self._get_existing_torrents()
@@ -175,34 +172,32 @@ class SeedRescuer(_PluginBase):
             for name, path, size in items:
                 stats["total"] += 1
                 if name in history:
-                    status = "✨ 已找回 (历史)"; stats["rescued"] += 1; conf = "100%"
+                    status = "✨ 已找回"; stats["rescued"] += 1; conf = "100%"
                 elif name in existing_torrents:
-                    status = "✅ 下载器已有"; stats["existing"] += 1; conf = "100%"
+                    status = "✅ 已存在"; stats["existing"] += 1; conf = "100%"
                 else:
-                    status = "⏳ 待处理"; conf = "-"
+                    status = "⏳ 待找回"; conf = "-"
                 all_items.append({"id": str(hash(path)), "name": name, "path": path, "size": size, "size_str": self._format_size(size), "status": status, "confidence": conf})
         
         self.cache.set("items", all_items); self.cache.set("stats", stats)
-        return {"code": 0, "message": f"扫描完成，识别到 {len(all_items)} 个影视资源"}
+        return {"code": 0, "message": f"发现 {len(all_items)} 个影视"}
 
     def download_item(self, item_id: str = None, **kwargs):
         items = self.cache.get("items") or []
         stats = self.cache.get("stats")
         target = next((i for i in items if i["id"] == item_id), None)
-        if not target: return {"code": 1, "message": "项目失效"}
+        if not target: return {"code": 1, "message": "失效"}
 
-        search_queries = []
-        search_queries.append(target["name"].replace(".", " "))
-        search_queries.append(re.sub(r'\[.*?\]', '', target["name"].replace(".", " ")).strip())
+        search_queries = [
+            target["name"].replace(".", " "),
+            re.sub(r'\[.*?\]', '', target["name"].replace(".", " ")).strip()
+        ]
         clean_title = self._parse_media_name(target["name"])
-        if clean_title:
-            search_queries.append(clean_title)
+        if clean_title: search_queries.append(clean_title)
 
         best_torrent = None
         best_diff = 1.0
-
         for query in list(dict.fromkeys(search_queries)): 
-            self.debug(f"尝试搜索词: {query}")
             results = self.sites_helper.search(keyword=query, site_ids=self._selected_sites)
             best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
             if best_torrent: break 
@@ -213,10 +208,10 @@ class SeedRescuer(_PluginBase):
                 target["status"] = "✨ 找回成功"; target["confidence"] = f"{100-best_diff*100:.3f}%"
                 stats["rescued"] += 1; self._save_history(target["name"])
                 self.cache.set("items", items); self.cache.set("stats", stats)
-                return {"code": 0, "message": "找回成功"}
+                return {"code": 0, "message": "成功"}
         
         stats["failed"] += 1; self.cache.set("stats", stats)
-        return {"code": 1, "message": "未匹配到完全一致的种子"}
+        return {"code": 1, "message": "未匹配"}
 
     def _parse_media_name(self, name: str) -> str:
         year_match = re.search(r'[\.\s](19|20)\d{2}[\.\s]', name)
@@ -232,29 +227,21 @@ class SeedRescuer(_PluginBase):
 
     def test_run(self, **kwargs):
         self.scan_now()
-        items = [i for i in self.cache.get("items", []) if "待处理" in i["status"]][:5]
+        items = [i for i in self.cache.get("items", []) if "待找回" in i["status"]][:5]
         if not items: return {"code": 1, "message": "无可测试项"}
         count = 0
         for item in items: 
             res = self.download_item(item_id=item["id"])
             if res.get("code") == 0: count += 1
-            delay = random.uniform(self._sleep_min, self._sleep_max)
-            self.info(f"防风控睡眠: 等待 {delay:.1f} 秒...")
-            time.sleep(delay)
-        return {"code": 0, "message": f"测试完成，成功 {count}/5 个，请检查 TR 状态"}
+            time.sleep(random.uniform(self._sleep_min, self._sleep_max))
+        return {"code": 0, "message": f"完成 {count}/5"}
 
     def download_all(self, **kwargs):
-        to_do = [i for i in self.cache.get("items", []) if "待处理" in i["status"]]
-        count = 0
+        to_do = [i for i in self.cache.get("items", []) if "待找回" in i["status"]]
         for i, item in enumerate(to_do):
-            self.info(f"正在全量执行 ({i+1}/{len(to_do)}): {item['name']}")
-            res = self.download_item(item_id=item["id"])
-            if res.get("code") == 0: count += 1
-            delay = random.uniform(self._sleep_min, self._sleep_max)
-            self.info(f"防风控睡眠: 等待 {delay:.1f} 秒...")
-            time.sleep(delay)
-        self.post_message(mtype=NotificationType.DownloadAdded, title="找回任务完成", text=f"成功为 {len(to_do)} 个资源找回了种子。")
-        return {"code": 0, "message": "全量任务已完成"}
+            self.download_item(item_id=item["id"])
+            time.sleep(random.uniform(self._sleep_min, self._sleep_max))
+        return {"code": 0, "message": "任务已完成"}
 
     def _get_local_items(self, scan_path: str) -> List[Tuple[str, str, int]]:
         res = []
@@ -302,9 +289,7 @@ class SeedRescuer(_PluginBase):
                 for tag in core_tags:
                     if tag.lower() not in t_title.lower():
                         tag_match = False; break
-                if tag_match:
-                    self.info(f"极致匹配成功！误差: {diff:.6%}, 标签校验通过: {core_tags}")
-                    return t, diff
+                if tag_match: return t, diff
         return None, 1.0
 
     def _download_and_add(self, torrent: Dict, local_path: str) -> Tuple[bool, str]:
@@ -314,8 +299,7 @@ class SeedRescuer(_PluginBase):
         if self._path_mapping and ":" in self._path_mapping:
             internal, external = self._path_mapping.split(":")
             save_path = save_path.replace(internal.replace("\\", "/"), external.replace("\\", "/"))
-        save_path = save_path.rstrip("/")
-        return downloader.instance.add_torrent(torrent_url=torrent.get('enclosure'), save_path=save_path, is_paused=self._only_paused, tag="SeedRescuer")
+        return downloader.instance.add_torrent(torrent_url=torrent.get('enclosure'), save_path=save_path.rstrip("/"), is_paused=self._only_paused, tag="SeedRescuer")
 
     def _format_size(self, size: int) -> str:
         for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
