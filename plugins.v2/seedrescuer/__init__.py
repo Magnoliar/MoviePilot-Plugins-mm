@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 class SeedRescuer(_PluginBase):
     # 插件基本信息
     plugin_name = "种子找回助手"
-    plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。(修复 401 及按钮文字不可见问题)"
+    plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。(完美修复按钮触发与401鉴权问题)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.1.4"  # 修复 UI 不显示、401 及部分潜在报错隐患
+    plugin_version = "5.1.5"  # 核心修复：引入 auth: bear 解决 API 路由的 401 和 404 问题
     plugin_author = "Gemini"
 
     # 内部变量
@@ -63,10 +63,10 @@ class SeedRescuer(_PluginBase):
             self._only_paused = config.get("only_paused", True)
             self._path_mapping = config.get("path_mapping", "")
             
-            # 安全转换整型，防止前端清空输入框传回空字符串导致 ValueError 崩溃
+            # 安全转换整型
             def safe_int(val, default):
                 try:
-                    return int(val) if val not in [None, ""] else default
+                    return int(val) if val not in[None, ""] else default
                 except (ValueError, TypeError):
                     return default
 
@@ -84,7 +84,6 @@ class SeedRescuer(_PluginBase):
         if not self._enabled or not self._cron:
             return[]
             
-        # 安全解析 Cron 表达式，防止无法注入到调度器
         try:
             trigger = CronTrigger.from_crontab(self._cron)
         except Exception:
@@ -119,7 +118,7 @@ class SeedRescuer(_PluginBase):
     #  表单页
     # ==========================
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        site_options = []
+        site_options =[]
         try:
             sites =[]
             if hasattr(self.sites_helper, 'get_indexers'):
@@ -205,7 +204,6 @@ class SeedRescuer(_PluginBase):
                 "props": {"class": "mt-4 mb-4"},
                 "content":[
                     {"component": "VCol", "content":[
-                        # 修改：使用标准的 text 和 prepend-icon 属性传递内容，Vuetify3完美适配
                         {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-3", "text": "扫描磁盘", "prepend-icon": "mdi-magnify"}, "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
                         {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-3", "text": "灰度测试", "prepend-icon": "mdi-test-tube"}, "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "get"}}},
                         {"component": "VBtn", "props": {"color": "success", "variant": "tonal", "class": "mr-3", "text": "全量找回", "prepend-icon": "mdi-rocket"}, "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "get"}}},
@@ -241,7 +239,6 @@ class SeedRescuer(_PluginBase):
         for item in data_list:
             item["actions"] =[
                 {
-                    # 同样通过 props 的 text 来传递文字
                     "component": "VBtn", 
                     "props": {"color": "primary", "variant": "tonal", "size": "small", "text": "下载", "prepend-icon": "mdi-download"}, 
                     "events": {
@@ -255,14 +252,49 @@ class SeedRescuer(_PluginBase):
             ]
         return {"data_list": data_list, "stats": self.cache.get("stats")}
 
-    def get_api(self) -> List[Dict[str, Any]]:
-        # 修改：由于上面的路由全部用于前端 UI 的点击交互，内部通信路由直接留空。
-        # 否则注册在此处会使它们变成对外 API，从而引发必须携带 API_TOKEN 的 401 Unauthorized 报错。
-        return[]
-
     # ==========================
     #  核心 API 及逻辑
     # ==========================
+    def get_api(self) -> List[Dict[str, Any]]:
+        # 核心修复点：强制指定 "auth": "bear"，允许前端网页登录态调用该接口，而不再强制索要系统的 API_TOKEN。
+        return[
+            {
+                "path": "/scan_now",
+                "endpoint": self.scan_now,
+                "methods": ["GET"],
+                "summary": "扫描磁盘",
+                "auth": "bear"
+            },
+            {
+                "path": "/test_run",
+                "endpoint": self.test_run,
+                "methods": ["GET"],
+                "summary": "灰度测试",
+                "auth": "bear"
+            },
+            {
+                "path": "/download_all",
+                "endpoint": self.download_all,
+                "methods":["GET"],
+                "summary": "全量自动化找回",
+                "auth": "bear"
+            },
+            {
+                "path": "/reset_history",
+                "endpoint": self.reset_history,
+                "methods": ["GET"],
+                "summary": "重置找回历史记录",
+                "auth": "bear"
+            },
+            {
+                "path": "/download_item",
+                "endpoint": self.download_item,
+                "methods": ["GET"],
+                "summary": "手动下载指定的丢失项",
+                "auth": "bear"
+            }
+        ]
+
     def reset_history(self, **kwargs):
         with self._history_lock:
             if self._history_file.exists(): 
@@ -315,7 +347,7 @@ class SeedRescuer(_PluginBase):
 
     def test_run(self, **kwargs):
         self.scan_now()
-        cached_items = self.cache.get("items") or[]
+        cached_items = self.cache.get("items") or []
         items =[i for i in cached_items if "待找回" in i.get("status", "")][:5]
         
         if not items: 
@@ -463,7 +495,6 @@ class SeedRescuer(_PluginBase):
             
         downloader = self.downloader_helper.get_service(name=self._downloader_name)
         if downloader and downloader.instance:
-            # 兼容性检查：判断是否存在 is_inactive
             is_inactive = getattr(downloader.instance, 'is_inactive', lambda: False)
             if not is_inactive():
                 try:
@@ -487,7 +518,7 @@ class SeedRescuer(_PluginBase):
                 return 999
                 
         sorted_res = sorted(search_results, key=get_priority)
-        core_tags =[w for w in["iQIYI", "MWeb", "Netflix", "NF", "Tencent", "WEB-DL", "BluRay", "REMUX", "HFR"] if w.lower() in local_name.lower()]
+        core_tags = [w for w in["iQIYI", "MWeb", "Netflix", "NF", "Tencent", "WEB-DL", "BluRay", "REMUX", "HFR"] if w.lower() in local_name.lower()]
         
         for t in sorted_res:
             t_size = getattr(t, 'size', 0)
