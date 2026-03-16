@@ -4,6 +4,7 @@ import time
 import json
 import random
 import threading
+import copy
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
@@ -18,7 +19,7 @@ class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.0.6"
+    plugin_version = "5.1.0"
     plugin_author = "Gemini"
 
     # 内部变量
@@ -86,31 +87,11 @@ class SeedRescuer(_PluginBase):
         self._history_file.write_text(json.dumps(history, ensure_ascii=False), encoding='utf-8')
 
     # ==========================
-    # 【彻底修复点】标准后端表单获取
+    # 获取插件配置表单 (解决Vue渲染错误)
+    # 严格返回纯表单元素与配置项，不可包含页面布局组件如 VTabs 等
     # ==========================
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """
-        向系统返回两项参数：1. 页面UI元素列表  2. 当前已保存的配置数据字典
-        解决解包 (unpack) 报错的终极方案
-        """
-        return self.get_page(), {
-            "enabled": self._enabled,
-            "scan_path": self._scan_path,
-            "selected_sites": self._selected_sites,
-            "downloader_name": self._downloader_name,
-            "cron": self._cron,
-            "only_paused": self._only_paused,
-            "max_depth": self._max_depth,
-            "path_mapping": self._path_mapping,
-            "sleep_min": self._sleep_min,
-            "sleep_max": self._sleep_max
-        }
-
-    # ==========================
-    #  前端 UI 定义 (V2 专用)
-    # ==========================
-    def get_page(self) -> List[dict]:
-        site_options =[]
+        site_options = []
         try:
             sites =[]
             if hasattr(self.sites_helper, 'get_indexers'):
@@ -132,58 +113,93 @@ class SeedRescuer(_PluginBase):
             downloader_options =[{"title": name, "value": name} for name in downloaders.keys()]
         except Exception:
             pass
+            
+        return [
+            {
+                "component": "VRow",
+                "content":[
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VSwitch", "props": {"model": "enabled", "label": "启用定时任务"}}]}, 
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VTextField", "props": {"model": "cron", "label": "自动周期", "placeholder": "0 2 * * *"}}]}, 
+                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VTextField", "props": {"model": "max_depth", "label": "扫描深度", "type": "number"}}]}
+                ]
+            },
+            {"component": "VTextField", "props": {"model": "scan_path", "label": "扫描路径 (逗号分隔)", "placeholder": "/media/movies"}},
+            {"component": "VTextField", "props": {"model": "path_mapping", "label": "路径转换", "placeholder": "/media:/downloads"}},
+            {
+                "component": "VRow", 
+                "content":[
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VSelect", "props": {"model": "selected_sites", "label": "选择站点", "items": site_options, "multiple": True, "chips": True}}]}, 
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VSelect", "props": {"model": "downloader_name", "label": "下载器", "items": downloader_options}}]}
+                ]
+            },
+            {
+                "component": "VRow", 
+                "content":[
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VTextField", "props": {"model": "sleep_min", "label": "最小延迟(秒)", "type": "number"}}]}, 
+                    {"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VTextField", "props": {"model": "sleep_max", "label": "最大延迟(秒)", "type": "number"}}]}
+                ]
+            },
+            {"component": "VSwitch", "props": {"model": "only_paused", "label": "暂停添加"}}
+        ], {
+            "enabled": self._enabled,
+            "scan_path": self._scan_path,
+            "selected_sites": self._selected_sites,
+            "downloader_name": self._downloader_name,
+            "cron": self._cron,
+            "only_paused": self._only_paused,
+            "max_depth": self._max_depth,
+            "path_mapping": self._path_mapping,
+            "sleep_min": self._sleep_min,
+            "sleep_max": self._sleep_max
+        }
 
+    # ==========================
+    #  获取详情展示页面 (不混杂表单配置)
+    # ==========================
+    def get_page(self) -> List[dict]:
         stats = self.cache.get("stats") or {}
 
         return[
             {
-                "component": "VTabs",
-                "content":[
+                "component": "div",
+                "content": [
                     {
-                        "title": "概览",
+                        "component": "VRow",
                         "content":[
-                            {
-                                "component": "VRow",
-                                "content":[
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "待找回项目", "subtitle": str(stats.get("total", 0))}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "成功找回", "subtitle": str(stats.get("rescued", 0))}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "已在下载器", "subtitle": str(stats.get("existing", 0))}}]},
-                                    {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "匹配失败", "subtitle": str(stats.get("failed", 0))}}]}
-                                ]
-                            },
-                            {
-                                "component": "VRow",
-                                "props": {"class": "mt-2"},
-                                "content":[
-                                    {"component": "VCol", "content":[
-                                        {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-2"}, "content": "🔍 扫描磁盘", "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
-                                        {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-2"}, "content": "🧪 灰度测试 (5项)", "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "post"}}},
-                                        {"component": "VBtn", "props": {"color": "success", "variant": "tonal"}, "content": "🚀 全量找回", "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "post"}}},
-                                    ]}
-                                ]
-                            },
-                            {"component": "VBtn", "props": {"color": "grey", "variant": "text", "class": "mt-4"}, "content": "重置记录", "events": {"click": {"api": "plugin/SeedRescuer/reset_history", "method": "post"}}}
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "待找回项目", "subtitle": str(stats.get("total", 0))}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "成功找回", "subtitle": str(stats.get("rescued", 0))}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "已在下载器", "subtitle": str(stats.get("existing", 0))}}]},
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content":[{"component": "VCard", "props": {"title": "匹配失败", "subtitle": str(stats.get("failed", 0))}}]}
                         ]
                     },
                     {
-                        "title": "清单",
+                        "component": "VRow",
+                        "props": {"class": "mt-2 mb-4"},
                         "content":[
-                            {"component": "VDataTable", "props": {"headers":[{"title": "目录名", "key": "name"}, {"title": "体积", "key": "size_str"}, {"title": "状态", "key": "status"}, {"title": "匹配率", "key": "confidence"}, {"title": "操作", "key": "actions", "sortable": False}], "items": "{{data_list}}"}}
+                            {"component": "VCol", "content":[
+                                {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-2"}, "content": "🔍 扫描磁盘", "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
+                                {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-2"}, "content": "🧪 灰度测试 (5项)", "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "post"}}},
+                                {"component": "VBtn", "props": {"color": "success", "variant": "tonal", "class": "mr-2"}, "content": "🚀 全量找回", "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "post"}}},
+                                {"component": "VBtn", "props": {"color": "error", "variant": "tonal"}, "content": "🗑️ 重置记录", "events": {"click": {"api": "plugin/SeedRescuer/reset_history", "method": "post"}}}
+                            ]}
                         ]
                     },
                     {
-                        "title": "设置",
+                        "component": "VCard",
+                        "props": {"title": "找回清单"},
                         "content":[
                             {
-                                "component": "VForm",
-                                "content":[
-                                    {"component": "VRow", "content":[{"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VSwitch", "props": {"model": "enabled", "label": "启用定时任务"}}]}, {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VTextField", "props": {"model": "cron", "label": "自动周期", "placeholder": "0 2 * * *"}}, ]}, {"component": "VCol", "props": {"cols": 12, "md": 4}, "content":[{"component": "VTextField", "props": {"model": "max_depth", "label": "扫描深度", "type": "number"}}]}]},
-                                    {"component": "VTextField", "props": {"model": "scan_path", "label": "扫描路径 (逗号分隔)", "placeholder": "/media/movies"}},
-                                    {"component": "VTextField", "props": {"model": "path_mapping", "label": "路径转换", "placeholder": "/media:/downloads"}},
-                                    {"component": "VRow", "content":[{"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VSelect", "props": {"model": "selected_sites", "label": "选择站点", "items": site_options, "multiple": True, "chips": True}}]}, {"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VSelect", "props": {"model": "downloader_name", "label": "下载器", "items": downloader_options}}]}]},
-                                    {"component": "VRow", "content":[{"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VTextField", "props": {"model": "sleep_min", "label": "最小延迟(秒)", "type": "number"}}]}, {"component": "VCol", "props": {"cols": 12, "md": 6}, "content":[{"component": "VTextField", "props": {"model": "sleep_max", "label": "最大延迟(秒)", "type": "number"}}]}]},
-                                    {"component": "VSwitch", "props": {"model": "only_paused", "label": "暂停添加"}}
-                                ]
+                                "component": "VDataTable", 
+                                "props": {
+                                    "headers":[
+                                        {"title": "目录名", "key": "name"}, 
+                                        {"title": "体积", "key": "size_str"}, 
+                                        {"title": "状态", "key": "status"}, 
+                                        {"title": "匹配率", "key": "confidence"}, 
+                                        {"title": "操作", "key": "actions", "sortable": False}
+                                    ], 
+                                    "items": "{{data_list}}"
+                                }
                             }
                         ]
                     }
@@ -193,17 +209,32 @@ class SeedRescuer(_PluginBase):
 
     def get_data(self) -> Dict[str, Any]:
         raw_data = self.cache.get("items") or[]
-        for item in raw_data:
-            item["actions"] =[{"component": "VBtn", "props": {"icon": "mdi-download", "variant": "text", "color": "primary"}, "events": {"click": {"api": "plugin/SeedRescuer/download_item", "method": "post", "data": {"item_id": item["id"]}}}}]
-        return {"data_list": raw_data, "stats": self.cache.get("stats")}
+        # 使用深拷贝防止Vue绑定事件修改持久化缓存从而导致溢出
+        data_list = copy.deepcopy(raw_data)
+        
+        for item in data_list:
+            item["actions"] =[
+                {
+                    "component": "VBtn", 
+                    "props": {"icon": "mdi-download", "variant": "text", "color": "primary"}, 
+                    "events": {
+                        "click": {
+                            "api": "plugin/SeedRescuer/download_item", 
+                            "method": "post", 
+                            "data": {"item_id": item["id"]}
+                        }
+                    }
+                }
+            ]
+        return {"data_list": data_list, "stats": self.cache.get("stats")}
 
     def get_api(self) -> List[Dict[str, Any]]:
         return[
-            {"path": "/scan_now", "endpoint": self.scan_now, "methods":["GET"]},
+            {"path": "/scan_now", "endpoint": self.scan_now, "methods": ["GET"]},
             {"path": "/download_item", "endpoint": self.download_item, "methods": ["POST"]},
             {"path": "/download_all", "endpoint": self.download_all, "methods": ["POST"]},
-            {"path": "/test_run", "endpoint": self.test_run, "methods":["POST"]},
-            {"path": "/reset_history", "endpoint": self.reset_history, "methods":["POST"]}
+            {"path": "/test_run", "endpoint": self.test_run, "methods": ["POST"]},
+            {"path": "/reset_history", "endpoint": self.reset_history, "methods": ["POST"]}
         ]
 
     # ==========================
@@ -271,7 +302,7 @@ class SeedRescuer(_PluginBase):
         return {"success": True, "message": f"已在后台启动灰度测试，将尝试找回 {len(items)} 个项目，请稍后刷新页面查看状态。"}
 
     def download_all(self, **kwargs):
-        cached_items = self.cache.get("items") or[]
+        cached_items = self.cache.get("items") or []
         to_do =[i for i in cached_items if "待找回" in i.get("status", "")]
         
         if not to_do: 
@@ -293,7 +324,7 @@ class SeedRescuer(_PluginBase):
         if not target: 
             return {"success": False, "message": "该记录已失效，请重新扫描"}
 
-        search_queries =[
+        search_queries = [
             target["name"].replace(".", " "),
             re.sub(r'\[.*?\]', '', target["name"].replace(".", " ")).strip()
         ]
@@ -372,7 +403,7 @@ class SeedRescuer(_PluginBase):
                                 res.append((item.name, str(item.absolute()), size))
                         else: 
                             scan_recursive(item, depth + 1)
-                    elif item.suffix.lower() in['.mp4', '.mkv', '.ts', '.iso']:
+                    elif item.suffix.lower() in ['.mp4', '.mkv', '.ts', '.iso']:
                         res.append((item.name, str(item.absolute()), item.stat().st_size))
                 except Exception:
                     continue
