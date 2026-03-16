@@ -20,9 +20,9 @@ from apscheduler.triggers.cron import CronTrigger
 
 class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
-    plugin_desc = "基于特征扫描智能找回种子。(v5.2.0 修复独立日志404与看板实时进度展示)"
+    plugin_desc = "基于特征扫描智能找回种子。(v5.2.1 修复UI动态渲染、表格空白与按钮无文字问题)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.2.0"  # 核心升级：独立日志文件写入 + 仪表板 Vue 变量热重载进度反馈
+    plugin_version = "5.2.1"  # 修复 MoviePilot 动态页面引擎无法渲染 Vue 变量与 VDataTable 的问题
     plugin_author = "Gemini"
     
     auth_level = 1
@@ -48,7 +48,7 @@ class SeedRescuer(_PluginBase):
         self.stop_service()
         self._exit_event.clear()
 
-        # 挂载独立的插件日志文件，解决 404 问题
+        # 初始化独立日志
         self._setup_logger()
 
         self.downloader_helper = DownloaderHelper()
@@ -80,12 +80,12 @@ class SeedRescuer(_PluginBase):
             self._sleep_max = safe_int(config.get("sleep_max"), 8)
 
     def _setup_logger(self):
-        """配置插件独立的日志输出文件，对接前端日志查看功能"""
+        """配置插件独立的日志输出文件"""
         log_dir = Path(getattr(settings, "LOG_PATH", "/moviepilot/logs")) / "plugins"
         log_dir.mkdir(parents=True, exist_ok=True)
         
-        # MoviePilot 前端默认请求的插件日志文件名为 类名小写.log
-        self.log_file = log_dir / f"{self.__class__.__name__.lower()}.log"
+        # 匹配前端请求的 /api/v1/system/logging?logfile=plugins/seedrescuer.log
+        self.log_file = log_dir / "seedrescuer.log"
         if not self.log_file.exists():
             self.log_file.touch()
 
@@ -93,16 +93,17 @@ class SeedRescuer(_PluginBase):
         self._logger.setLevel(logging.INFO)
         self._logger.handlers.clear()
 
-        # 循环文件日志处理器
         file_handler = RotatingFileHandler(self.log_file, maxBytes=2*1024*1024, backupCount=3, encoding='utf-8')
         formatter = logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s')
         file_handler.setFormatter(formatter)
         self._logger.addHandler(file_handler)
 
-        # 控制台处理器（可选输出到主日志）
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         self._logger.addHandler(console_handler)
+        
+        # 立即写入一条日志，确保文件被实际创建并持有，解决 404 问题
+        self._logger.info("[SeedRescuer] 插件日志模块初始化完毕。")
 
     def get_state(self) -> bool:
         return self._enabled
@@ -242,33 +243,67 @@ class SeedRescuer(_PluginBase):
         }
 
     # ==========================
-    #  数据看板展示页面 (引入 Vue 热重载变量)
+    #  数据看板展示页面 (深度修复引擎渲染机制)
     # ==========================
     def get_page(self) -> List[dict]:
+        # 获取当前缓存数据
+        stats = self.cache.get("stats") or {"total": 0, "rescued": 0, "existing": 0, "failed": 0}
+        status_msg = self.cache.get("status_msg") or "空闲中 (等待任务指令)"
+        data_list = self.cache.get("items") or[]
+
+        # 动态构建 VTable 表体内容，抛弃不支持原生渲染的 VDataTable
+        tbody_content =[]
+        for item in data_list:
+            tbody_content.append({
+                "component": "tr",
+                "content":[
+                    {"component": "td", "text": str(item.get("name", ""))},
+                    {"component": "td", "text": str(item.get("size_str", ""))},
+                    {"component": "td", "text": str(item.get("status", ""))},
+                    {"component": "td", "text": str(item.get("confidence", ""))},
+                    {"component": "td", "content":[
+                        {
+                            "component": "VBtn",
+                            "props": {"color": "primary", "variant": "tonal", "size": "small", "prepend-icon": "mdi-download"},
+                            "text": "下载",  # Button 的直接文字节点
+                            "events": {"click": {"api": "plugin/SeedRescuer/download_item", "method": "get", "params": {"item_id": item["id"]}}}
+                        }
+                    ]}
+                ]
+            })
+
+        # 空状态提示
+        if not tbody_content:
+            tbody_content.append({
+                "component": "tr",
+                "content":[{"component": "td", "props": {"colspan": 5, "class": "text-center text-grey"}, "text": "暂无扫描数据"}]
+            })
+
         return[
             {
                 "component": "VAlert",
                 "props": {"type": "info", "variant": "tonal", "class": "mb-4", "border": "start"},
-                "text": "状态监控: {{status_msg}}"
+                "text": f"状态监控: {status_msg}"
             },
             {
                 "component": "VRow",
                 "content":[
-                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "待找回项目", "subtitle": "{{stat_total}}"}}] },
-                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "成功找回", "subtitle": "{{stat_rescued}}"}}] },
-                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "已在下载器", "subtitle": "{{stat_existing}}"}}] },
-                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "匹配失败", "subtitle": "{{stat_failed}}"}}] }
+                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "待找回项目", "subtitle": str(stats.get("total", 0))}}] },
+                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "成功找回", "subtitle": str(stats.get("rescued", 0))}}] },
+                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "已在下载器", "subtitle": str(stats.get("existing", 0))}}] },
+                    {"component": "VCol", "props": {"cols": 6, "md": 3, "xl": 3}, "content":[{"component": "VCard", "props": {"title": "匹配失败", "subtitle": str(stats.get("failed", 0))}}] }
                 ]
             },
             {
                 "component": "VRow",
                 "props": {"class": "mt-4 mb-4"},
-                "content": [
+                "content":[
                     {"component": "VCol", "content":[
-                        {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-3 mb-2", "text": "扫描磁盘", "prepend-icon": "mdi-magnify"}, "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
-                        {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-3 mb-2", "text": "灰度测试", "prepend-icon": "mdi-test-tube"}, "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "get"}}},
-                        {"component": "VBtn", "props": {"color": "success", "variant": "tonal", "class": "mr-3 mb-2", "text": "全量找回", "prepend-icon": "mdi-rocket"}, "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "get"}}},
-                        {"component": "VBtn", "props": {"color": "error", "variant": "tonal", "class": "mb-2", "text": "重置记录", "prepend-icon": "mdi-delete"}, "events": {"click": {"api": "plugin/SeedRescuer/reset_history", "method": "get"}}}
+                        # 重点修复：MoviePilot 渲染器使用 root "text" 作为按钮文本
+                        {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-magnify"}, "text": "扫描磁盘", "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
+                        {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-test-tube"}, "text": "灰度测试", "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "get"}}},
+                        {"component": "VBtn", "props": {"color": "success", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-rocket"}, "text": "全量找回", "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "get"}}},
+                        {"component": "VBtn", "props": {"color": "error", "variant": "tonal", "class": "mb-2", "prepend-icon": "mdi-delete"}, "text": "重置记录", "events": {"click": {"api": "plugin/SeedRescuer/reset_history", "method": "get"}}}
                     ]}
                 ]
             },
@@ -276,47 +311,37 @@ class SeedRescuer(_PluginBase):
                 "component": "VCard",
                 "props": {"title": "找回清单"},
                 "content":[
+                    # 重点修复：使用标准的 VTable 构建数据清单，支持完美解析
                     {
-                        "component": "VDataTable", 
-                        "props": {
-                            "headers":[
-                                {"title": "目录名", "key": "name"}, 
-                                {"title": "体积", "key": "size_str"}, 
-                                {"title": "状态", "key": "status"}, 
-                                {"title": "匹配率", "key": "confidence"}, 
-                                {"title": "操作", "key": "actions", "sortable": False}
-                            ], 
-                            "items": "{{data_list}}"
-                        }
+                        "component": "VTable",
+                        "props": {"hover": True, "fixed-header": True, "density": "comfortable"},
+                        "content":[
+                            {
+                                "component": "thead",
+                                "content":[{
+                                    "component": "tr",
+                                    "content":[
+                                        {"component": "th", "text": "目录名"},
+                                        {"component": "th", "text": "体积"},
+                                        {"component": "th", "text": "状态"},
+                                        {"component": "th", "text": "匹配率"},
+                                        {"component": "th", "text": "操作"}
+                                    ]
+                                }]
+                            },
+                            {
+                                "component": "tbody",
+                                "content": tbody_content
+                            }
+                        ]
                     }
                 ]
             }
         ]
 
+    # 由于采用了 VTable 原生全量渲染，不需要再依赖 get_data 返回给底层接管
     def get_data(self) -> Dict[str, Any]:
-        """将缓存数据与页面 Vue 变量绑定，实现看板无刷新热重载"""
-        raw_data = self.cache.get("items") or[]
-        data_list = copy.deepcopy(raw_data)
-        
-        for item in data_list:
-            item["actions"] =[
-                {
-                    "component": "VBtn", 
-                    "props": {"color": "primary", "variant": "tonal", "size": "small", "text": "下载", "prepend-icon": "mdi-download"}, 
-                    "events": {"click": {"api": "plugin/SeedRescuer/download_item", "method": "get", "params": {"item_id": item["id"]}}}
-                }
-            ]
-            
-        stats = self.cache.get("stats") or {"total": 0, "rescued": 0, "existing": 0, "failed": 0}
-        
-        return {
-            "data_list": data_list, 
-            "stat_total": str(stats.get("total", 0)),
-            "stat_rescued": str(stats.get("rescued", 0)),
-            "stat_existing": str(stats.get("existing", 0)),
-            "stat_failed": str(stats.get("failed", 0)),
-            "status_msg": self.cache.get("status_msg") or "空闲中 (等待任务指令)"
-        }
+        return {}
 
     # ==========================
     #  核心 API 及逻辑
@@ -325,7 +350,7 @@ class SeedRescuer(_PluginBase):
         return[
             {"path": "/scan_now", "endpoint": self.scan_now, "methods": ["GET"], "summary": "扫描磁盘", "auth": "bear"},
             {"path": "/test_run", "endpoint": self.test_run, "methods": ["GET"], "summary": "灰度测试", "auth": "bear"},
-            {"path": "/download_all", "endpoint": self.download_all, "methods": ["GET"], "summary": "全量自动化找回", "auth": "bear"},
+            {"path": "/download_all", "endpoint": self.download_all, "methods":["GET"], "summary": "全量自动化找回", "auth": "bear"},
             {"path": "/reset_history", "endpoint": self.reset_history, "methods": ["GET"], "summary": "重置找回历史记录", "auth": "bear"},
             {"path": "/download_item", "endpoint": self.download_item, "methods": ["GET"], "summary": "手动下载指定的丢失项", "auth": "bear"}
         ]
@@ -423,7 +448,7 @@ class SeedRescuer(_PluginBase):
                 self._logger.info("灰度测试运行结束")
                     
             threading.Thread(target=run_test_background, daemon=True).start()
-            return {"success": True, "message": f"已在后台启动灰度测试，将尝试找回 {len(items)} 个项目，请稍后刷新页面查看状态。"}
+            return {"success": True, "message": f"已在后台启动灰度测试，将尝试找回 {len(items)} 个项目，请随时刷新页面查看状态。"}
         finally:
             self._task_lock.release()
 
@@ -470,7 +495,7 @@ class SeedRescuer(_PluginBase):
             return {"success": False, "message": "该记录已失效，请重新扫描"}
 
         clean_name = re.sub(r'\[.*?\]', '', target["name"].replace(".", " ")).strip()
-        search_queries = [
+        search_queries =[
             target["name"].replace(".", " "),
             clean_name if clean_name else target["name"] 
         ]
