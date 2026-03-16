@@ -15,21 +15,18 @@ from app.helper.downloader import DownloaderHelper
 from app.helper.sites import SitesHelper
 from app.core.cache import TTLCache
 
-# 引入 Cron 解析器
 from apscheduler.triggers.cron import CronTrigger
 
-# 初始化日志记录器
 logger = logging.getLogger(__name__)
 
 class SeedRescuer(_PluginBase):
-    # 插件基本信息
     plugin_name = "种子找回助手"
-    plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。(完美修复按钮触发与401鉴权问题)"
+    plugin_desc = "基于特征扫描智能找回种子。(v5.1.7 吸收优秀的生命周期管理与并发防抖设计)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.1.5"  # 核心修复：引入 auth: bear 解决 API 路由的 401 和 404 问题
+    plugin_version = "5.1.7"  # 吸收参考代码精华：增加优雅退出机制、任务并发锁
     plugin_author = "Gemini"
 
-    # 内部变量
+    # 内部配置变量
     _enabled = False
     _scan_path = ""
     _selected_sites =[]
@@ -43,10 +40,16 @@ class SeedRescuer(_PluginBase):
     
     _history_file = Path(settings.PLUGIN_DATA_PATH) / "seed_rescuer_history.json"
     
-    # 增加线程锁，保护 JSON 读写不被并发破坏
+    # 线程与并发控制锁
     _history_lock = threading.Lock()
+    _task_lock = threading.RLock()         # 保证同时只有一个耗时任务运行
+    _exit_event = threading.Event()        # 控制插件停止时的线程退出
 
     def init_plugin(self, config: dict = None):
+        # 停止现有服务，清理旧标记
+        self.stop_service()
+        self._exit_event.clear()
+
         self.downloader_helper = DownloaderHelper()
         self.sites_helper = SitesHelper()
         self.cache = TTLCache(region="SeedRescuer", maxsize=1000, ttl=86400)
@@ -63,10 +66,9 @@ class SeedRescuer(_PluginBase):
             self._only_paused = config.get("only_paused", True)
             self._path_mapping = config.get("path_mapping", "")
             
-            # 安全转换整型
             def safe_int(val, default):
                 try:
-                    return int(val) if val not in[None, ""] else default
+                    return int(val) if val not in [None, ""] else default
                 except (ValueError, TypeError):
                     return default
 
@@ -78,7 +80,16 @@ class SeedRescuer(_PluginBase):
         return self._enabled
 
     def stop_service(self):
-        pass
+        """
+        [参考优秀设计] 插件停用时的生命周期管理：发送退出信号、清空内存缓存
+        """
+        try:
+            logger.info("[SeedRescuer] 尝试停止插件服务并释放资源...")
+            self._exit_event.set()  # 通知所有运行中的后台循环线程立即中断
+            if hasattr(self, 'cache') and self.cache:
+                self.cache.clear()
+        except Exception as e:
+            logger.error(f"[SeedRescuer] 插件服务停止异常: {str(e)}", exc_info=True)
 
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled or not self._cron:
@@ -86,7 +97,8 @@ class SeedRescuer(_PluginBase):
             
         try:
             trigger = CronTrigger.from_crontab(self._cron)
-        except Exception:
+        except Exception as e:
+            logger.error(f"[SeedRescuer] Cron 表达式解析失败: {e}", exc_info=True)
             return []
 
         return[{
@@ -132,14 +144,14 @@ class SeedRescuer(_PluginBase):
                 if s_id and s_name:
                     site_options.append({"title": s_name, "value": s_id})
         except Exception as e:
-            logger.error(f"[SeedRescuer] 获取站点列表失败: {e}")
+            logger.error(f"[SeedRescuer] 获取站点列表失败: {e}", exc_info=True)
 
         downloader_options =[]
         try:
             downloaders = self.downloader_helper.get_configs()
             downloader_options =[{"title": name, "value": name} for name in downloaders.keys()]
         except Exception as e:
-            logger.error(f"[SeedRescuer] 获取下载器列表失败: {e}")
+            logger.error(f"[SeedRescuer] 获取下载器列表失败: {e}", exc_info=True)
             
         return[
             {
@@ -202,7 +214,7 @@ class SeedRescuer(_PluginBase):
             {
                 "component": "VRow",
                 "props": {"class": "mt-4 mb-4"},
-                "content":[
+                "content": [
                     {"component": "VCol", "content":[
                         {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-3", "text": "扫描磁盘", "prepend-icon": "mdi-magnify"}, "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
                         {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-3", "text": "灰度测试", "prepend-icon": "mdi-test-tube"}, "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "get"}}},
@@ -256,7 +268,6 @@ class SeedRescuer(_PluginBase):
     #  核心 API 及逻辑
     # ==========================
     def get_api(self) -> List[Dict[str, Any]]:
-        # 核心修复点：强制指定 "auth": "bear"，允许前端网页登录态调用该接口，而不再强制索要系统的 API_TOKEN。
         return[
             {
                 "path": "/scan_now",
@@ -275,7 +286,7 @@ class SeedRescuer(_PluginBase):
             {
                 "path": "/download_all",
                 "endpoint": self.download_all,
-                "methods":["GET"],
+                "methods": ["GET"],
                 "summary": "全量自动化找回",
                 "auth": "bear"
             },
@@ -295,94 +306,121 @@ class SeedRescuer(_PluginBase):
             }
         ]
 
-    def reset_history(self, **kwargs):
+    def reset_history(self):
         with self._history_lock:
             if self._history_file.exists(): 
                 self._history_file.unlink()
         logger.info("[SeedRescuer] 历史记录已被重置")
         return {"success": True, "message": "找回历史记录已清空重置"}
 
-    def scan_now(self, **kwargs):
-        if not self._scan_path: 
-            return {"success": False, "message": "未配置扫描路径，请先在底角⚙️设置中配置。"}
+    def scan_now(self):
+        #[参考优秀设计] 并发安全：使用非阻塞锁确保扫描任务不会被重复并行点击触发
+        if not self._task_lock.acquire(blocking=False):
+            return {"success": False, "message": "已有后台任务正在运行，请稍候..."}
             
-        all_items =[]
-        with self._history_lock:
-            history = self._load_history()
+        try:
+            if not self._scan_path: 
+                return {"success": False, "message": "未配置扫描路径，请先在底角⚙️设置中配置。"}
+                
+            all_items =[]
+            with self._history_lock:
+                history = self._load_history()
+                
+            existing_torrents = self._get_existing_torrents()
+            paths =[p.strip() for p in self._scan_path.split(",") if p.strip()]
+            stats = {"total": 0, "rescued": 0, "existing": 0, "failed": 0}
+
+            for base_path in paths:
+                items = self._get_local_items(base_path)
+                for name, path, size in items:
+                    stats["total"] += 1
+                    if name in history:
+                        status = "✨ 已找回"
+                        stats["rescued"] += 1
+                        conf = "100%"
+                    elif name in existing_torrents:
+                        status = "✅ 已存在"
+                        stats["existing"] += 1
+                        conf = "100%"
+                    else:
+                        status = "⏳ 待找回"
+                        conf = "-"
+                    
+                    all_items.append({
+                        "id": str(hash(path)), 
+                        "name": name, 
+                        "path": path, 
+                        "size": size, 
+                        "size_str": self._format_size(size), 
+                        "status": status, 
+                        "confidence": conf
+                    })
             
-        existing_torrents = self._get_existing_torrents()
-        paths =[p.strip() for p in self._scan_path.split(",") if p.strip()]
-        stats = {"total": 0, "rescued": 0, "existing": 0, "failed": 0}
+            self.cache.set("items", all_items)
+            self.cache.set("stats", stats)
+            logger.info(f"[SeedRescuer] 磁盘扫描完成，共发现 {len(all_items)} 个符合特征的项")
+            return {"success": True, "message": f"扫描完毕，共发现 {len(all_items)} 个符合特征的影视文件夹/文件。"}
+        except Exception as e:
+            logger.error(f"[SeedRescuer] 磁盘扫描时发生异常: {e}", exc_info=True)
+            return {"success": False, "message": "扫描异常，请查看系统日志。"}
+        finally:
+            self._task_lock.release()
 
-        for base_path in paths:
-            items = self._get_local_items(base_path)
-            for name, path, size in items:
-                stats["total"] += 1
-                if name in history:
-                    status = "✨ 已找回"
-                    stats["rescued"] += 1
-                    conf = "100%"
-                elif name in existing_torrents:
-                    status = "✅ 已存在"
-                    stats["existing"] += 1
-                    conf = "100%"
-                else:
-                    status = "⏳ 待找回"
-                    conf = "-"
-                
-                all_items.append({
-                    "id": str(hash(path)), 
-                    "name": name, 
-                    "path": path, 
-                    "size": size, 
-                    "size_str": self._format_size(size), 
-                    "status": status, 
-                    "confidence": conf
-                })
-        
-        self.cache.set("items", all_items)
-        self.cache.set("stats", stats)
-        logger.info(f"[SeedRescuer] 磁盘扫描完成，共发现 {len(all_items)} 个符合特征的项")
-        return {"success": True, "message": f"扫描完毕，共发现 {len(all_items)} 个符合特征的影视文件夹/文件。"}
+    def test_run(self):
+        if not self._task_lock.acquire(blocking=False):
+            return {"success": False, "message": "已有任务正在运行中，请稍后再试"}
+            
+        try:
+            self.scan_now()
+            cached_items = self.cache.get("items") or []
+            items =[i for i in cached_items if "待找回" in i.get("status", "")] [:5]
+            
+            if not items: 
+                return {"success": False, "message": "清单中没有待找回的项目"}
 
-    def test_run(self, **kwargs):
-        self.scan_now()
-        cached_items = self.cache.get("items") or []
-        items =[i for i in cached_items if "待找回" in i.get("status", "")][:5]
-        
-        if not items: 
-            return {"success": False, "message": "清单中没有待找回的项目"}
+            def run_test_background():
+                logger.info(f"[SeedRescuer] 启动灰度测试，将尝试找回 {len(items)} 个项目")
+                for item in items: 
+                    #[参考优秀设计] 运行中随时检查是否收到退出或禁用信号
+                    if self._exit_event.is_set():
+                        logger.warning("[SeedRescuer] 收到停止信号，中止测试任务")
+                        break
+                    self.download_item(item_id=item["id"])
+                    time.sleep(random.uniform(self._sleep_min, self._sleep_max))
+                logger.info("[SeedRescuer] 灰度测试运行结束")
+                    
+            threading.Thread(target=run_test_background, daemon=True).start()
+            return {"success": True, "message": f"已在后台启动灰度测试，将尝试找回 {len(items)} 个项目，请稍后刷新页面查看状态。"}
+        finally:
+            self._task_lock.release()
 
-        def run_test_background():
-            logger.info(f"[SeedRescuer] 启动灰度测试，将尝试找回 {len(items)} 个项目")
-            for item in items: 
-                self.download_item(item_id=item["id"])
-                time.sleep(random.uniform(self._sleep_min, self._sleep_max))
-            logger.info("[SeedRescuer] 灰度测试运行结束")
-                
-        threading.Thread(target=run_test_background, daemon=True).start()
-        return {"success": True, "message": f"已在后台启动灰度测试，将尝试找回 {len(items)} 个项目，请稍后刷新页面查看状态。"}
+    def download_all(self):
+        if not self._task_lock.acquire(blocking=False):
+            return {"success": False, "message": "已有任务正在运行中，请稍后再试"}
+            
+        try:
+            cached_items = self.cache.get("items") or []
+            to_do =[i for i in cached_items if "待找回" in i.get("status", "")]
+            
+            if not to_do: 
+                return {"success": False, "message": "清单中没有待找回的项目，请先执行扫描！"}
 
-    def download_all(self, **kwargs):
-        cached_items = self.cache.get("items") or []
-        to_do =[i for i in cached_items if "待找回" in i.get("status", "")]
-        
-        if not to_do: 
-            return {"success": False, "message": "清单中没有待找回的项目，请先执行扫描！"}
+            def run_all_background():
+                logger.info(f"[SeedRescuer] 启动全量自动化找回，将尝试找回 {len(to_do)} 个项目")
+                for item in to_do:
+                    if self._exit_event.is_set():
+                        logger.warning("[SeedRescuer] 收到停止信号，中止全量自动化找回任务")
+                        break
+                    self.download_item(item_id=item["id"])
+                    time.sleep(random.uniform(self._sleep_min, self._sleep_max))
+                logger.info("[SeedRescuer] 全量自动化找回运行结束")
+                    
+            threading.Thread(target=run_all_background, daemon=True).start()
+            return {"success": True, "message": f"全量自动化作业已在后台启动，共计 {len(to_do)} 个任务，请随时刷新看板。"}
+        finally:
+            self._task_lock.release()
 
-        def run_all_background():
-            logger.info(f"[SeedRescuer] 启动全量自动化找回，将尝试找回 {len(to_do)} 个项目")
-            for item in to_do:
-                self.download_item(item_id=item["id"])
-                time.sleep(random.uniform(self._sleep_min, self._sleep_max))
-            logger.info("[SeedRescuer] 全量自动化找回运行结束")
-                
-        threading.Thread(target=run_all_background, daemon=True).start()
-        return {"success": True, "message": f"全量自动化作业已在后台启动，共计 {len(to_do)} 个任务，请随时刷新看板。"}
-
-    def download_item(self, item_id: str = None, **kwargs):
-        if not item_id:
-            item_id = kwargs.get("item_id")
+    def download_item(self, item_id: str):
         if not item_id:
             return {"success": False, "message": "缺少必要参数 item_id"}
 
@@ -413,7 +451,7 @@ class SeedRescuer(_PluginBase):
                     if best_torrent: 
                         break 
                 except Exception as e:
-                    logger.error(f"[SeedRescuer] 站点搜索失败 {query}: {e}")
+                    logger.error(f"[SeedRescuer] 站点搜索失败 {query}: {e}", exc_info=True)
 
         if best_torrent:
             success, msg = self._download_and_add(best_torrent, target["path"])
@@ -480,7 +518,7 @@ class SeedRescuer(_PluginBase):
                                 res.append((item.name, str(item.absolute()), size))
                         else: 
                             scan_recursive(item, depth + 1)
-                    elif item.suffix.lower() in ['.mp4', '.mkv', '.ts', '.iso']:
+                    elif item.suffix.lower() in['.mp4', '.mkv', '.ts', '.iso']:
                         res.append((item.name, str(item.absolute()), item.stat().st_size))
                 except Exception:
                     continue
@@ -518,7 +556,7 @@ class SeedRescuer(_PluginBase):
                 return 999
                 
         sorted_res = sorted(search_results, key=get_priority)
-        core_tags = [w for w in["iQIYI", "MWeb", "Netflix", "NF", "Tencent", "WEB-DL", "BluRay", "REMUX", "HFR"] if w.lower() in local_name.lower()]
+        core_tags =[w for w in["iQIYI", "MWeb", "Netflix", "NF", "Tencent", "WEB-DL", "BluRay", "REMUX", "HFR"] if w.lower() in local_name.lower()]
         
         for t in sorted_res:
             t_size = getattr(t, 'size', 0)
@@ -572,11 +610,11 @@ class SeedRescuer(_PluginBase):
             )
             return success, ("添加成功" if success else "下载器拒绝接受任务")
         except Exception as e:
-            logger.error(f"[SeedRescuer] 种子提交到下载器时发生异常: {e}")
+            logger.error(f"[SeedRescuer] 种子提交到下载器时发生异常: {e}", exc_info=True)
             return False, str(e)
 
     def _format_size(self, size: int) -> str:
-        for unit in['B', 'KB', 'MB', 'GB', 'TB']:
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
             if size < 1024: 
                 return f"{size:.2f} {unit}"
             size /= 1024
