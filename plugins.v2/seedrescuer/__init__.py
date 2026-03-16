@@ -17,8 +17,9 @@ class SeedRescuer(_PluginBase):
     # 插件基本信息
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
-    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/pt.png"
-    plugin_version = "5.0.4"
+    # 【已恢复】你的专属图标，且使用正确的 Raw 链接
+    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
+    plugin_version = "5.0.5"
     plugin_author = "Gemini"
 
     # 内部变量
@@ -40,7 +41,6 @@ class SeedRescuer(_PluginBase):
         self.sites_helper = SitesHelper()
         self.cache = TTLCache(region="SeedRescuer", maxsize=1000, ttl=86400)
         
-        # 【修复点1】：去掉了带默认值的 cache.get
         if not self.cache.get("stats"):
             self.cache.set("stats", {"total": 0, "rescued": 0, "existing": 0, "failed": 0})
 
@@ -59,15 +59,12 @@ class SeedRescuer(_PluginBase):
     def get_state(self) -> bool:
         return self._enabled
 
-    def get_form(self) -> List[dict]:
-        return self.get_page()
-
     def stop_service(self):
         pass
 
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled or not self._cron:
-            return []
+            return[]
         return[{
             "id": "seed_rescuer_auto_task",
             "name": "种子自动找回",
@@ -90,7 +87,28 @@ class SeedRescuer(_PluginBase):
         self._history_file.write_text(json.dumps(history, ensure_ascii=False), encoding='utf-8')
 
     # ==========================
-    #  前端 UI 定义
+    # 【彻底修复点】后端配置字典定义
+    # ==========================
+    def get_form(self) -> Dict[str, Any]:
+        """
+        必须返回一个标准字典，供系统底层遍历注册默认配置。
+        不再将其与 V2 的 get_page(UI 组件列表) 混用！
+        """
+        return {
+            "enabled": {"title": "启用定时任务", "type": "bool", "default": False},
+            "cron": {"title": "自动周期", "type": "text", "default": ""},
+            "max_depth": {"title": "扫描深度", "type": "number", "default": 3},
+            "scan_path": {"title": "扫描路径", "type": "text", "default": ""},
+            "path_mapping": {"title": "路径转换", "type": "text", "default": ""},
+            "selected_sites": {"title": "选择站点", "type": "list", "default":[]},
+            "downloader_name": {"title": "下载器", "type": "text", "default": ""},
+            "sleep_min": {"title": "最小延迟(秒)", "type": "number", "default": 3},
+            "sleep_max": {"title": "最大延迟(秒)", "type": "number", "default": 8},
+            "only_paused": {"title": "暂停添加", "type": "bool", "default": True}
+        }
+
+    # ==========================
+    #  前端 UI 定义 (V2 专用)
     # ==========================
     def get_page(self) -> List[dict]:
         site_options =[]
@@ -116,7 +134,6 @@ class SeedRescuer(_PluginBase):
         except Exception:
             pass
 
-        # 【修复点2】：安全获取缓存，不再使用 cache.get("stats", {})
         stats = self.cache.get("stats") or {}
 
         return[
@@ -176,7 +193,6 @@ class SeedRescuer(_PluginBase):
         ]
 
     def get_data(self) -> Dict[str, Any]:
-        # 【修复点3】：使用 or[] 安全回退
         raw_data = self.cache.get("items") or[]
         for item in raw_data:
             item["actions"] =[{"component": "VBtn", "props": {"icon": "mdi-download", "variant": "text", "color": "primary"}, "events": {"click": {"api": "plugin/SeedRescuer/download_item", "method": "post", "data": {"item_id": item["id"]}}}}]
@@ -241,7 +257,6 @@ class SeedRescuer(_PluginBase):
 
     def test_run(self, **kwargs):
         self.scan_now()
-        # 【修复点4】：避免缓存方法传参数组引起错误
         cached_items = self.cache.get("items") or[]
         items =[i for i in cached_items if "待找回" in i.get("status", "")][:5]
         
