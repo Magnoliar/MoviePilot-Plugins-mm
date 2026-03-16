@@ -17,8 +17,8 @@ class SeedRescuer(_PluginBase):
     # 插件基本信息
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
-    plugin_icon = "mediasyncdel.png"
-    plugin_version = "5.0.1"
+    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
+    plugin_version = "5.0.2"
     plugin_author = "Gemini"
 
     # 内部变量
