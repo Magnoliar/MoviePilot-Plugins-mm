@@ -17,7 +17,7 @@ class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
     plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "3.9" # 提升版本号
+    plugin_version = "4.0"
     plugin_author = "Gemini"
 
     # 内部变量
@@ -53,6 +53,22 @@ class SeedRescuer(_PluginBase):
             self._path_mapping = config.get("path_mapping", "")
             self._sleep_min = int(config.get("sleep_min", 3))
             self._sleep_max = int(config.get("sleep_max", 8))
+
+    # --- 必须实现的抽象方法补全 ---
+
+    def get_state(self) -> bool:
+        """返回插件运行状态"""
+        return self._enabled
+
+    def get_form(self) -> List[dict]:
+        """MoviePilot 部分版本调用此方法获取配置表单"""
+        return self.get_page()
+
+    def stop_service(self):
+        """停止插件服务逻辑"""
+        pass
+
+    # ---------------------------
 
     def _load_history(self) -> Dict[str, bool]:
         if self._history_file.exists():
