@@ -5,6 +5,7 @@ import json
 import random
 import threading
 import copy
+import logging
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
@@ -17,12 +18,15 @@ from app.core.cache import TTLCache
 # 引入 Cron 解析器
 from apscheduler.triggers.cron import CronTrigger
 
+# 初始化日志记录器
+logger = logging.getLogger(__name__)
+
 class SeedRescuer(_PluginBase):
     # 插件基本信息
     plugin_name = "种子找回助手"
-    plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。"
+    plugin_desc = "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。(修复 401 及按钮文字不可见问题)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.1.3"  # 更新修复 UI 排版问题
+    plugin_version = "5.1.4"  # 修复 UI 不显示、401 及部分潜在报错隐患
     plugin_author = "Gemini"
 
     # 内部变量
@@ -112,7 +116,7 @@ class SeedRescuer(_PluginBase):
             self._history_file.write_text(json.dumps(history, ensure_ascii=False), encoding='utf-8')
 
     # ==========================
-    #  表单页 (修复太紧凑的问题：加入 mb-4 和 mt-2 间距)
+    #  表单页
     # ==========================
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         site_options = []
@@ -128,15 +132,15 @@ class SeedRescuer(_PluginBase):
                 s_name = s.get("name") if isinstance(s, dict) else getattr(s, "name", "")
                 if s_id and s_name:
                     site_options.append({"title": s_name, "value": s_id})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"[SeedRescuer] 获取站点列表失败: {e}")
 
         downloader_options =[]
         try:
             downloaders = self.downloader_helper.get_configs()
-            downloader_options = [{"title": name, "value": name} for name in downloaders.keys()]
-        except Exception:
-            pass
+            downloader_options =[{"title": name, "value": name} for name in downloaders.keys()]
+        except Exception as e:
+            logger.error(f"[SeedRescuer] 获取下载器列表失败: {e}")
             
         return[
             {
@@ -181,13 +185,12 @@ class SeedRescuer(_PluginBase):
         }
 
     # ==========================
-    #  数据看板展示页面 (修复按钮字不显示的问题)
+    #  数据看板展示页面
     # ==========================
     def get_page(self) -> List[dict]:
         stats = self.cache.get("stats") or {}
 
-        # 移除外层的原生 div 包裹，让 Vuetify 直接渲染这些组件，防止 CSS 丢失
-        return [
+        return[
             {
                 "component": "VRow",
                 "content":[
@@ -202,11 +205,11 @@ class SeedRescuer(_PluginBase):
                 "props": {"class": "mt-4 mb-4"},
                 "content":[
                     {"component": "VCol", "content":[
-                        # 换回 content 以正常显示文字和 emoji
-                        {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-3"}, "content": "🔍 扫描磁盘", "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
-                        {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-3"}, "content": "🧪 灰度测试", "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "get"}}},
-                        {"component": "VBtn", "props": {"color": "success", "variant": "tonal", "class": "mr-3"}, "content": "🚀 全量找回", "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "get"}}},
-                        {"component": "VBtn", "props": {"color": "error", "variant": "tonal"}, "content": "🗑️ 重置记录", "events": {"click": {"api": "plugin/SeedRescuer/reset_history", "method": "get"}}}
+                        # 修改：使用标准的 text 和 prepend-icon 属性传递内容，Vuetify3完美适配
+                        {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-3", "text": "扫描磁盘", "prepend-icon": "mdi-magnify"}, "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
+                        {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-3", "text": "灰度测试", "prepend-icon": "mdi-test-tube"}, "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "get"}}},
+                        {"component": "VBtn", "props": {"color": "success", "variant": "tonal", "class": "mr-3", "text": "全量找回", "prepend-icon": "mdi-rocket"}, "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "get"}}},
+                        {"component": "VBtn", "props": {"color": "error", "variant": "tonal", "text": "重置记录", "prepend-icon": "mdi-delete"}, "events": {"click": {"api": "plugin/SeedRescuer/reset_history", "method": "get"}}}
                     ]}
                 ]
             },
@@ -238,10 +241,9 @@ class SeedRescuer(_PluginBase):
         for item in data_list:
             item["actions"] =[
                 {
-                    # 避免 icon 丢失，直接使用有明确文字描述的按钮
+                    # 同样通过 props 的 text 来传递文字
                     "component": "VBtn", 
-                    "props": {"color": "primary", "variant": "tonal", "size": "small"}, 
-                    "content": "📥 下载",
+                    "props": {"color": "primary", "variant": "tonal", "size": "small", "text": "下载", "prepend-icon": "mdi-download"}, 
                     "events": {
                         "click": {
                             "api": "plugin/SeedRescuer/download_item", 
@@ -254,13 +256,9 @@ class SeedRescuer(_PluginBase):
         return {"data_list": data_list, "stats": self.cache.get("stats")}
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return[
-            {"path": "/scan_now", "endpoint": self.scan_now, "methods": ["GET"], "summary": "扫描磁盘"},
-            {"path": "/download_item", "endpoint": self.download_item, "methods": ["GET"], "summary": "下载指定项"},
-            {"path": "/download_all", "endpoint": self.download_all, "methods": ["GET"], "summary": "全量找回"},
-            {"path": "/test_run", "endpoint": self.test_run, "methods": ["GET"], "summary": "灰度测试"},
-            {"path": "/reset_history", "endpoint": self.reset_history, "methods":["GET"], "summary": "重置历史记录"}
-        ]
+        # 修改：由于上面的路由全部用于前端 UI 的点击交互，内部通信路由直接留空。
+        # 否则注册在此处会使它们变成对外 API，从而引发必须携带 API_TOKEN 的 401 Unauthorized 报错。
+        return[]
 
     # ==========================
     #  核心 API 及逻辑
@@ -269,6 +267,7 @@ class SeedRescuer(_PluginBase):
         with self._history_lock:
             if self._history_file.exists(): 
                 self._history_file.unlink()
+        logger.info("[SeedRescuer] 历史记录已被重置")
         return {"success": True, "message": "找回历史记录已清空重置"}
 
     def scan_now(self, **kwargs):
@@ -311,20 +310,23 @@ class SeedRescuer(_PluginBase):
         
         self.cache.set("items", all_items)
         self.cache.set("stats", stats)
+        logger.info(f"[SeedRescuer] 磁盘扫描完成，共发现 {len(all_items)} 个符合特征的项")
         return {"success": True, "message": f"扫描完毕，共发现 {len(all_items)} 个符合特征的影视文件夹/文件。"}
 
     def test_run(self, **kwargs):
         self.scan_now()
-        cached_items = self.cache.get("items") or []
+        cached_items = self.cache.get("items") or[]
         items =[i for i in cached_items if "待找回" in i.get("status", "")][:5]
         
         if not items: 
             return {"success": False, "message": "清单中没有待找回的项目"}
 
         def run_test_background():
+            logger.info(f"[SeedRescuer] 启动灰度测试，将尝试找回 {len(items)} 个项目")
             for item in items: 
                 self.download_item(item_id=item["id"])
                 time.sleep(random.uniform(self._sleep_min, self._sleep_max))
+            logger.info("[SeedRescuer] 灰度测试运行结束")
                 
         threading.Thread(target=run_test_background, daemon=True).start()
         return {"success": True, "message": f"已在后台启动灰度测试，将尝试找回 {len(items)} 个项目，请稍后刷新页面查看状态。"}
@@ -337,9 +339,11 @@ class SeedRescuer(_PluginBase):
             return {"success": False, "message": "清单中没有待找回的项目，请先执行扫描！"}
 
         def run_all_background():
+            logger.info(f"[SeedRescuer] 启动全量自动化找回，将尝试找回 {len(to_do)} 个项目")
             for item in to_do:
                 self.download_item(item_id=item["id"])
                 time.sleep(random.uniform(self._sleep_min, self._sleep_max))
+            logger.info("[SeedRescuer] 全量自动化找回运行结束")
                 
         threading.Thread(target=run_all_background, daemon=True).start()
         return {"success": True, "message": f"全量自动化作业已在后台启动，共计 {len(to_do)} 个任务，请随时刷新看板。"}
@@ -371,10 +375,13 @@ class SeedRescuer(_PluginBase):
         
         for query in list(dict.fromkeys(search_queries)): 
             if hasattr(self.sites_helper, 'search'):
-                results = self.sites_helper.search(keyword=query, site_ids=self._selected_sites)
-                best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
-                if best_torrent: 
-                    break 
+                try:
+                    results = self.sites_helper.search(keyword=query, site_ids=self._selected_sites)
+                    best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
+                    if best_torrent: 
+                        break 
+                except Exception as e:
+                    logger.error(f"[SeedRescuer] 站点搜索失败 {query}: {e}")
 
         if best_torrent:
             success, msg = self._download_and_add(best_torrent, target["path"])
@@ -386,8 +393,10 @@ class SeedRescuer(_PluginBase):
                 
                 self.cache.set("items", items)
                 self.cache.set("stats", stats)
+                logger.info(f"[SeedRescuer] 找回成功: {target['name']}")
                 return {"success": True, "message": f"找回成功！精准度: {100-best_diff*100:.3f}%"}
             else:
+                logger.warning(f"[SeedRescuer] 推送到下载器失败: {target['name']} -> {msg}")
                 return {"success": False, "message": f"推送到下载器失败: {msg}"}
         
         stats["failed"] += 1
@@ -449,15 +458,21 @@ class SeedRescuer(_PluginBase):
 
     def _get_existing_torrents(self) -> set:
         names = set()
+        if not self._downloader_name:
+            return names
+            
         downloader = self.downloader_helper.get_service(name=self._downloader_name)
-        if downloader and not downloader.instance.is_inactive():
-            try:
-                torrents = downloader.instance.get_torrents()
-                if torrents:
-                    for t in torrents: 
-                        names.add(t.name)
-            except Exception:
-                pass
+        if downloader and downloader.instance:
+            # 兼容性检查：判断是否存在 is_inactive
+            is_inactive = getattr(downloader.instance, 'is_inactive', lambda: False)
+            if not is_inactive():
+                try:
+                    torrents = downloader.instance.get_torrents()
+                    if torrents:
+                        for t in torrents: 
+                            names.add(t.name)
+                except Exception as e:
+                    logger.warning(f"[SeedRescuer] 获取下载器当前种子状态时出现问题: {e}")
         return names
 
     def _match_torrent(self, search_results: List[Any], target_size: int, local_name: str) -> Tuple[Optional[Any], float]:
@@ -494,9 +509,16 @@ class SeedRescuer(_PluginBase):
         return None, 1.0
 
     def _download_and_add(self, torrent: Any, local_path: str) -> Tuple[bool, str]:
+        if not self._downloader_name:
+            return False, "未配置下载器"
+            
         downloader = self.downloader_helper.get_service(name=self._downloader_name)
-        if not downloader or downloader.instance.is_inactive(): 
-            return False, "选定下载器当前不可用或已离线"
+        if not downloader or not downloader.instance: 
+            return False, "选定下载器配置不存在或服务未启动"
+            
+        is_inactive = getattr(downloader.instance, 'is_inactive', None)
+        if callable(is_inactive) and is_inactive():
+            return False, "选定下载器当前处于离线状态"
             
         save_path = str(Path(local_path).parent).replace("\\", "/")
         
@@ -519,10 +541,11 @@ class SeedRescuer(_PluginBase):
             )
             return success, ("添加成功" if success else "下载器拒绝接受任务")
         except Exception as e:
+            logger.error(f"[SeedRescuer] 种子提交到下载器时发生异常: {e}")
             return False, str(e)
 
     def _format_size(self, size: int) -> str:
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        for unit in['B', 'KB', 'MB', 'GB', 'TB']:
             if size < 1024: 
                 return f"{size:.2f} {unit}"
             size /= 1024
