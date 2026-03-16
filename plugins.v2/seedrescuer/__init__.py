@@ -21,11 +21,17 @@ from app.utils.http import RequestUtils
 
 from apscheduler.triggers.cron import CronTrigger
 
+# 核心修复：引入原生的 TorrentsChain 检索总线
+try:
+    from app.chain.torrents import TorrentsChain
+except ImportError:
+    TorrentsChain = None
+
 class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
-    plugin_desc = "基于特征扫描智能找回种子。(v5.2.3 支持隐藏已存在项目，吸收社区神级下载链接解析方案)"
+    plugin_desc = "基于特征扫描智能找回种子。(v5.2.4 完美修复 V2 搜索组件静默拦截跳过问题)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.2.3"  # 核心升级：新增隐藏已存在项目开关，融合代理链接解析与 letdown=1 免确认下载
+    plugin_version = "5.2.4"  # 核心升级：对接 TorrentsChain 并构建三重 API 容灾链路，彻底解决搜索被跳过的假象
     plugin_author = "Gemini"
     
     auth_level = 1
@@ -36,7 +42,7 @@ class SeedRescuer(_PluginBase):
     _downloader_name = ""
     _cron = ""
     _only_paused = True
-    _hide_existing = True  # 新增：是否隐藏已在下载器中的项目
+    _hide_existing = True 
     _max_depth = 3
     _path_mapping = ""
     _sleep_min = 3
@@ -58,6 +64,12 @@ class SeedRescuer(_PluginBase):
         self.downloader_helper = DownloaderHelper()
         self.sites_helper = SitesHelper()
         self.cache = TTLCache(region="SeedRescuer", maxsize=1000, ttl=86400)
+        
+        # 挂载 MoviePilot V2 检索总线
+        if TorrentsChain:
+            self.torrents_chain = TorrentsChain()
+        else:
+            self.torrents_chain = None
         
         if not self.cache.get("stats"):
             self.cache.set("stats", {"total": 0, "rescued": 0, "existing": 0, "failed": 0})
@@ -85,7 +97,6 @@ class SeedRescuer(_PluginBase):
             self._sleep_max = safe_int(config.get("sleep_max"), 8)
 
     def _setup_logger(self):
-        """配置插件独立的日志输出文件"""
         log_dir = Path(getattr(settings, "LOG_PATH", "/moviepilot/logs")) / "plugins"
         log_dir.mkdir(parents=True, exist_ok=True)
         
@@ -400,7 +411,6 @@ class SeedRescuer(_PluginBase):
                         status = "✅ 已存在"
                         stats["existing"] += 1
                         conf = "100%"
-                        # 核心特性：如果开启了隐藏已存在的项目，则不再追加进清单表格列表
                         if self._hide_existing:
                             continue
                         stats["total"] += 1
@@ -497,6 +507,58 @@ class SeedRescuer(_PluginBase):
         finally:
             self._task_lock.release()
 
+    # 核心检索通道容灾封装：规避不同 MP 版本中组件缺失导致的跳过问题
+    def _search_torrents(self, query: str, site_ids: list = None) -> List[Any]:
+        results = None
+        
+        # 1. 尝试使用 V2 原生的 TorrentsChain 总线
+        if self.torrents_chain and hasattr(self.torrents_chain, 'search'):
+            try:
+                res = self.torrents_chain.search(keyword=query)
+                if res is not None: results = res
+            except Exception as e:
+                self._logger.debug(f"TorrentsChain.search(keyword) 异常: {e}")
+        
+        # 2. 如果结果依然为空，尝试降级直接使用底层 Indexer
+        if results is None:
+            try:
+                from app.modules.indexer.indexer import Indexer
+                res = Indexer().search_torrents(keyword=query)
+                if res is not None: results = res
+            except Exception as e:
+                self._logger.debug(f"Indexer.search_torrents 异常: {e}")
+                
+        # 3. 最终尝试 V1 旧版组件 SitesHelper (向下兼容防御)
+        if results is None and hasattr(self.sites_helper, 'search'):
+            try:
+                res = self.sites_helper.search(keyword=query)
+                if res is not None: results = res
+            except Exception as e:
+                self._logger.debug(f"SitesHelper.search(keyword) 异常: {e}")
+
+        # 如果三重容灾全部失败，暴露出致命错误而不是静默掩盖
+        if results is None:
+            self._logger.error("  ├─ ❌ 致命错误: 系统未开放任何搜索 API 接口，组件容灾调用均告失败！")
+            return []
+            
+        valid_results =[]
+        for t in results:
+            if hasattr(t, 'torrent_info'):
+                valid_results.append(t.torrent_info)
+            else:
+                valid_results.append(t)
+                
+        # 本地级站点白名单过滤（由于有的检索组件不支持传入白名单，故我们拿到全部后进行本地剔除）
+        if site_ids:
+            filtered =[]
+            for t in valid_results:
+                t_site = str(getattr(t, 'site', getattr(t, 'site_id', '')))
+                if t_site in map(str, site_ids):
+                    filtered.append(t)
+            return filtered
+
+        return valid_results
+
     def download_item(self, item_id: str):
         if not item_id:
             return {"success": False, "message": "缺少必要参数 item_id"}
@@ -508,7 +570,7 @@ class SeedRescuer(_PluginBase):
         if not target: 
             return {"success": False, "message": "该记录已失效，请重新扫描"}
 
-        self._logger.info(f"▶ 开始尝试找回: [{target['name']}] (原始体积: {self._format_size(target['size'])})")
+        self._logger.info(f"▶ 开始尝试找回:[{target['name']}] (原始体积: {self._format_size(target['size'])})")
 
         clean_name = re.sub(r'[\[\]\(\)\{\}\-\_\￡\@]', ' ', target["name"]).replace(".", " ")
         clean_name = re.sub(r'\s+', ' ', clean_name).strip()
@@ -529,16 +591,17 @@ class SeedRescuer(_PluginBase):
         
         for query in search_queries: 
             if not query: continue
-            if hasattr(self.sites_helper, 'search'):
-                try:
-                    self._logger.info(f"  ├─ 发起搜索: '{query}'")
-                    results = self.sites_helper.search(keyword=query, site_ids=self._selected_sites)
-                    self._logger.info(f"  ├─ 收到结果: {len(results) if results else 0} 条，进入二次校验...")
-                    best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
-                    if best_torrent: 
-                        break 
-                except Exception as e:
-                    self._logger.error(f"  ├─ 站点搜索抛出异常 [{query}]: {e}", exc_info=True)
+            try:
+                self._logger.info(f"  ├─ 发起搜索: '{query}'")
+                # 使用安全封装的容灾接口发起搜索
+                results = self._search_torrents(query, self._selected_sites)
+                self._logger.info(f"  ├─ 收到结果: {len(results) if results else 0} 条，进入二次校验...")
+                
+                best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
+                if best_torrent: 
+                    break 
+            except Exception as e:
+                self._logger.error(f"  ├─ 站点搜索或匹配时发生异常 [{query}]: {e}", exc_info=True)
 
         if best_torrent:
             success, msg = self._download_and_add(best_torrent, target["path"])
@@ -562,7 +625,7 @@ class SeedRescuer(_PluginBase):
         
         self.cache.set("items", items)
         self.cache.set("stats", stats)
-        self._logger.warning(f"  └─ ❌ 匹配失败: 所有站点的结果均被特征/体积校验过滤")
+        self._logger.warning(f"  └─ ❌ 匹配失败: 所有站点的结果均被特征/体积校验过滤，未命中符合要求的种子。")
         return {"success": False, "message": "未匹配到体积或特征相符的种子"}
 
     # ==========================
@@ -688,12 +751,12 @@ class SeedRescuer(_PluginBase):
                 else:
                     self._logger.info(f"    └─ [⏭ 跳过] 标签不符: {t_title}")
             else:
-                self._logger.info(f"    └─[⏭ 跳过] 体积不符: {t_title} (远程体积: {self._format_size(t_size)} | 差距: {diff*100:.2f}%)")
+                self._logger.info(f"    └─ [⏭ 跳过] 体积不符: {t_title} (远程体积: {self._format_size(t_size)} | 差距: {diff*100:.2f}%)")
                     
         self._logger.info(f"    └─ 无完全匹配项。最小体积误差: {best_diff*100:.2f}%")
         return None, best_diff
 
-    # 吸收社区优秀代码：处理 MoviePilot 的 base64 代理下载链接
+    # 解析：处理 MoviePilot 的 base64 代理下载链接
     def _resolve_base64_url(self, url: str) -> str:
         if not url or not url.startswith("["): 
             return url
@@ -715,7 +778,7 @@ class SeedRescuer(_PluginBase):
             self._logger.warning(f"尝试解析 base64 代理链接发生异常: {e}")
         return url
 
-    # 吸收社区优秀代码：处理 NexusPHP 跳过下载确认页
+    # 解析：处理 NexusPHP 跳过下载确认页 (letdown=1)
     def _resolve_nexusphp_letdown(self, url: str) -> str:
         if not url or url.startswith("magnet"): 
             return url
@@ -752,7 +815,6 @@ class SeedRescuer(_PluginBase):
 
         torrent_url = getattr(torrent, 'enclosure', getattr(torrent, 'url', ''))
         
-        # 核心修复：运用提取的两个链接解析器，最大程度保障种子下载能拿到实际文件而不是一个弹窗网页
         torrent_url = self._resolve_base64_url(torrent_url)
         torrent_url = self._resolve_nexusphp_letdown(torrent_url)
         
