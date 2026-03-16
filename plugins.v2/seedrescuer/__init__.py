@@ -8,7 +8,7 @@ import copy
 import base64
 import logging
 from logging.handlers import RotatingFileHandler
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 from pathlib import Path
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
@@ -18,10 +18,11 @@ from app.helper.downloader import DownloaderHelper
 from app.helper.sites import SitesHelper
 from app.core.cache import TTLCache
 from app.utils.http import RequestUtils
+from app.schemas import NotificationType
 
 from apscheduler.triggers.cron import CronTrigger
 
-# 核心修复：引入原生的 TorrentsChain 检索总线
+# 引入原生的 TorrentsChain 检索总线
 try:
     from app.chain.torrents import TorrentsChain
 except ImportError:
@@ -29,20 +30,21 @@ except ImportError:
 
 class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
-    plugin_desc = "基于特征扫描智能找回种子。(v5.2.4 完美修复 V2 搜索组件静默拦截跳过问题)"
+    plugin_desc = "基于特征扫描智能找回种子。(v5.3.0 官方规范重构，支持动态服务获取与消息推送)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.2.4"  # 核心升级：对接 TorrentsChain 并构建三重 API 容灾链路，彻底解决搜索被跳过的假象
+    plugin_version = "5.3.0"  # 完全符合官方 V2 插件开发指南，引入 @property 服务共享与系统 Notification
     plugin_author = "Gemini"
     
     auth_level = 1
 
     _enabled = False
+    _notify = True
     _scan_path = ""
     _selected_sites =[]
     _downloader_name = ""
     _cron = ""
     _only_paused = True
-    _hide_existing = True 
+    _hide_existing = True
     _max_depth = 3
     _path_mapping = ""
     _sleep_min = 3
@@ -78,6 +80,7 @@ class SeedRescuer(_PluginBase):
 
         if config:
             self._enabled = config.get("enabled", False)
+            self._notify = config.get("notify", True)
             self._scan_path = config.get("scan_path", "")
             self._selected_sites = config.get("selected_sites",[])
             self._downloader_name = config.get("downloader_name", "")
@@ -116,8 +119,27 @@ class SeedRescuer(_PluginBase):
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         self._logger.addHandler(console_handler)
-        
-        self._logger.info("[SeedRescuer] 插件日志模块初始化完毕。")
+
+    # ==========================
+    #  官方推荐：服务实例动态共享
+    # ==========================
+    @property
+    def service_info(self) -> Optional[Any]:
+        """动态获取下载器服务信息，防止实例失效重启导致报错"""
+        if not self._downloader_name:
+            return None
+        service = self.downloader_helper.get_service(name=self._downloader_name)
+        if not service:
+            return None
+        # 判断实例存活
+        if hasattr(service.instance, 'is_inactive') and service.instance.is_inactive():
+            return None
+        return service
+
+    @property
+    def downloader(self) -> Optional[Any]:
+        """提取下载器可执行实例"""
+        return self.service_info.instance if self.service_info else None
 
     def get_state(self) -> bool:
         return self._enabled
@@ -165,6 +187,11 @@ class SeedRescuer(_PluginBase):
             history[item_name] = True
             self._history_file.write_text(json.dumps(history, ensure_ascii=False), encoding='utf-8')
 
+    def _send_notify(self, title: str, text: str):
+        """发送系统通知"""
+        if self._notify:
+            self.post_message(mtype=NotificationType.Plugin, title=title, text=text)
+
     # ==========================
     #  表单页
     # ==========================
@@ -200,7 +227,7 @@ class SeedRescuer(_PluginBase):
                     "content":[
                         {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 6, "xs": 12}, "content":[{"component": "VSwitch", "props": {"model": "enabled", "label": "启用定时任务", "hint": "插件总开关：启动后根据设定的周期在后台自动执行找回任务。"}}] },
                         {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 6, "xs": 12}, "content":[{"component": "VTextField", "props": {"model": "cron", "label": "自动周期", "placeholder": "0 2 * * *", "hint": "设置后台全量自动化找回的周期（支持5位 Cron 表达式）。"}}] },
-                        {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 6, "xs": 12}, "content":[{"component": "VSwitch", "props": {"model": "hide_existing", "label": "隐藏已存在的项目", "hint": "开启后，下方的找回清单表格将不再展示已存在于下载器中的项目，保持界面清爽（极其推荐）。"}}] }
+                        {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 12, "xs": 12}, "content":[{"component": "VSwitch", "props": {"model": "notify", "label": "发送通知", "hint": "找回成功及自动化任务结束时发送系统通知。"}}] }
                     ]
                 },
                 {
@@ -223,7 +250,8 @@ class SeedRescuer(_PluginBase):
                     "content":[
                         {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 6, "xs": 12}, "content":[{"component": "VTextField", "props": {"model": "sleep_min", "label": "检索最小延迟(秒)", "type": "number", "hint": "发起站点搜索前的随机等待时间下限，防止风控封号。"}}] },
                         {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 6, "xs": 12}, "content":[{"component": "VTextField", "props": {"model": "sleep_max", "label": "检索最大延迟(秒)", "type": "number", "hint": "发起站点搜索前的随机等待时间上限。"}}] },
-                        {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 12, "xs": 12}, "content":[{"component": "VSwitch", "props": {"model": "only_paused", "label": "强行暂停添加", "hint": "推送到下载器后，强制保持暂停状态，不自动开始进行校验或下载。"}}] }
+                        {"component": "VCol", "props": {"cols": 12, "xxl": 2, "xl": 2, "lg": 2, "md": 2, "sm": 6, "xs": 12}, "content":[{"component": "VSwitch", "props": {"model": "only_paused", "label": "强行暂停添加", "hint": "推送到下载器后，强制保持暂停状态。"}}] },
+                        {"component": "VCol", "props": {"cols": 12, "xxl": 2, "xl": 2, "lg": 2, "md": 2, "sm": 6, "xs": 12}, "content":[{"component": "VSwitch", "props": {"model": "hide_existing", "label": "隐藏已存在项目", "hint": "开启后清单中不展示已在下载器中的内容。"}}] }
                     ]
                 },
                 {
@@ -234,7 +262,7 @@ class SeedRescuer(_PluginBase):
                         "content":[{
                             "component": "VAlert",
                             "props": {"type": "info", "variant": "tonal", "class": "mt-2"},
-                            "text": "配置完成后，您可以直接前往插件的专属操作面板，手动触发“磁盘扫描”与“找回测试”。所有自动化操作和进度均会在系统日志中留痕。"
+                            "text": "配置完成后，您可以直接前往插件的专属操作面板，手动触发“磁盘扫描”与“找回测试”。如果极端情况搜索不到种子，您也可以去操作面板复制“绝对路径”来手动推送给下载器。"
                         }]
                     }]
                 }
@@ -243,6 +271,7 @@ class SeedRescuer(_PluginBase):
         
         return elements, {
             "enabled": self._enabled,
+            "notify": self._notify,
             "scan_path": self._scan_path,
             "selected_sites": self._selected_sites,
             "downloader_name": self._downloader_name,
@@ -277,7 +306,10 @@ class SeedRescuer(_PluginBase):
             tbody_content.append({
                 "component": "tr",
                 "content":[
-                    {"component": "td", "text": str(item.get("name", ""))},
+                    {"component": "td", "content":[
+                        {"component": "div", "props": {"class": "font-weight-bold"}, "text": str(item.get("name", ""))},
+                        {"component": "div", "props": {"class": "text-caption text-grey", "style": "user-select: all; cursor: pointer;"}, "text": str(item.get("path", ""))}
+                    ]},
                     {"component": "td", "text": str(item.get("size_str", ""))},
                     {"component": "td", "props": {"class": status_color}, "text": status_text},
                     {"component": "td", "text": str(item.get("confidence", ""))},
@@ -285,7 +317,7 @@ class SeedRescuer(_PluginBase):
                         {
                             "component": "VBtn",
                             "props": {"color": "primary", "variant": "tonal", "size": "small", "prepend-icon": "mdi-download"},
-                            "text": "下载",
+                            "text": "自动找回",
                             "events": {"click": {"api": "plugin/SeedRescuer/download_item", "method": "get", "params": {"item_id": item["id"]}}}
                         }
                     ]}
@@ -339,7 +371,7 @@ class SeedRescuer(_PluginBase):
                                 "content":[{
                                     "component": "tr",
                                     "content":[
-                                        {"component": "th", "text": "目录名"},
+                                        {"component": "th", "text": "项目详情 (带路径)"},
                                         {"component": "th", "text": "体积"},
                                         {"component": "th", "text": "状态"},
                                         {"component": "th", "text": "匹配率"},
@@ -458,6 +490,7 @@ class SeedRescuer(_PluginBase):
 
             def run_test_background():
                 self._logger.info(f"启动灰度测试，将尝试找回 {len(items)} 个项目")
+                success_count = 0
                 for idx, item in enumerate(items): 
                     if self._exit_event.is_set():
                         self._logger.warning("收到停止信号，中止测试任务")
@@ -465,10 +498,14 @@ class SeedRescuer(_PluginBase):
                         break
                     
                     self.cache.set("status_msg", f"正在灰度测试: {item['name']} ({idx+1}/{len(items)})")
-                    self.download_item(item_id=item["id"])
+                    res = self.download_item(item_id=item["id"])
+                    if res and res.get("success"):
+                        success_count += 1
+                        
                     time.sleep(random.uniform(self._sleep_min, self._sleep_max))
                     
                 self.cache.set("status_msg", "空闲中 (灰度测试结束)")
+                self._send_notify("灰度测试运行结束", f"测试计划共 {len(items)} 项，成功找回 {success_count} 项。")
                 self._logger.info("灰度测试运行结束")
                     
             threading.Thread(target=run_test_background, daemon=True).start()
@@ -489,6 +526,7 @@ class SeedRescuer(_PluginBase):
 
             def run_all_background():
                 self._logger.info(f"启动全量自动化找回，共计 {len(to_do)} 个项目")
+                success_count = 0
                 for idx, item in enumerate(to_do):
                     if self._exit_event.is_set():
                         self._logger.warning("收到停止信号，中止全量自动化找回任务")
@@ -496,10 +534,14 @@ class SeedRescuer(_PluginBase):
                         break
                     
                     self.cache.set("status_msg", f"全量自动化找回中: {item['name']} ({idx+1}/{len(to_do)})")
-                    self.download_item(item_id=item["id"])
+                    res = self.download_item(item_id=item["id"])
+                    if res and res.get("success"):
+                        success_count += 1
+                        
                     time.sleep(random.uniform(self._sleep_min, self._sleep_max))
                     
                 self.cache.set("status_msg", "空闲中 (全量找回任务结束)")
+                self._send_notify("全量自动化找回结束", f"全量自动化找回计划执行完毕。共处理 {len(to_do)} 个找回项，成功找回 {success_count} 个。")
                 self._logger.info("全量自动化找回运行结束")
                     
             threading.Thread(target=run_all_background, daemon=True).start()
@@ -507,39 +549,63 @@ class SeedRescuer(_PluginBase):
         finally:
             self._task_lock.release()
 
-    # 核心检索通道容灾封装：规避不同 MP 版本中组件缺失导致的跳过问题
     def _search_torrents(self, query: str, site_ids: list = None) -> List[Any]:
         results = None
         
-        # 1. 尝试使用 V2 原生的 TorrentsChain 总线
-        if self.torrents_chain and hasattr(self.torrents_chain, 'search'):
-            try:
-                res = self.torrents_chain.search(keyword=query)
-                if res is not None: results = res
-            except Exception as e:
-                self._logger.debug(f"TorrentsChain.search(keyword) 异常: {e}")
-        
-        # 2. 如果结果依然为空，尝试降级直接使用底层 Indexer
+        # 1. 尝试方法 A: 调用 MoviePilot V2 标准的 SearchChain
         if results is None:
             try:
-                from app.modules.indexer.indexer import Indexer
+                from app.chain.search import SearchChain
+                func_code = SearchChain.process.__code__.co_varnames
+                ctx = SearchChain().process(keyword=query) if 'keyword' in func_code else SearchChain().process(title=query)
+                if ctx:
+                    if hasattr(ctx, 'torrents'):
+                        results = ctx.torrents
+                    elif isinstance(ctx, list):
+                        results = ctx
+            except Exception as e:
+                self._logger.debug(f"SearchChain 方式调用失败: {e}")
+
+        # 2. 尝试方法 B: 降级调用底层 Indexer 搜索模块
+        if results is None:
+            try:
+                from app.modules.indexer import Indexer
                 res = Indexer().search_torrents(keyword=query)
                 if res is not None: results = res
             except Exception as e:
-                self._logger.debug(f"Indexer.search_torrents 异常: {e}")
-                
-        # 3. 最终尝试 V1 旧版组件 SitesHelper (向下兼容防御)
+                self._logger.debug(f"Indexer 方式调用失败: {e}")
+
+        # 3. 尝试方法 C: 旧版遗留接口 SitesHelper (向下兼容防御)
         if results is None and hasattr(self.sites_helper, 'search'):
             try:
                 res = self.sites_helper.search(keyword=query)
                 if res is not None: results = res
             except Exception as e:
-                self._logger.debug(f"SitesHelper.search(keyword) 异常: {e}")
+                self._logger.debug(f"SitesHelper 方式调用失败: {e}")
 
-        # 如果三重容灾全部失败，暴露出致命错误而不是静默掩盖
+        # 4. 尝试方法 D: 内部 HTTP 接口 (最强兜底方案)
         if results is None:
-            self._logger.error("  ├─ ❌ 致命错误: 系统未开放任何搜索 API 接口，组件容灾调用均告失败！")
-            return []
+            try:
+                token = getattr(settings, "API_TOKEN", "")
+                port = getattr(settings, "PORT", 3000)
+                if token:
+                    res = RequestUtils().get_res(
+                        f"http://127.0.0.1:{port}/api/v1/search/title", 
+                        params={"keyword": query},
+                        headers={"Authorization": f"Bearer {token}"}
+                    )
+                    if res and res.status_code == 200:
+                        data = res.json()
+                        if isinstance(data, list):
+                            results = data
+                        elif isinstance(data, dict) and 'data' in data:
+                            results = data['data']
+            except Exception as e:
+                self._logger.debug(f"内部 HTTP API 方式调用失败: {e}")
+
+        if results is None:
+            self._logger.error("  ├─ ❌ 致命错误: 系统未开放任何搜索 API 接口，所有容灾链路调用均告失败！")
+            return[]
             
         valid_results =[]
         for t in results:
@@ -548,11 +614,14 @@ class SeedRescuer(_PluginBase):
             else:
                 valid_results.append(t)
                 
-        # 本地级站点白名单过滤（由于有的检索组件不支持传入白名单，故我们拿到全部后进行本地剔除）
         if site_ids:
             filtered =[]
             for t in valid_results:
-                t_site = str(getattr(t, 'site', getattr(t, 'site_id', '')))
+                if isinstance(t, dict):
+                    t_site = str(t.get('site') or t.get('site_id', ''))
+                else:
+                    t_site = str(getattr(t, 'site', getattr(t, 'site_id', '')))
+                    
                 if t_site in map(str, site_ids):
                     filtered.append(t)
             return filtered
@@ -593,13 +662,13 @@ class SeedRescuer(_PluginBase):
             if not query: continue
             try:
                 self._logger.info(f"  ├─ 发起搜索: '{query}'")
-                # 使用安全封装的容灾接口发起搜索
                 results = self._search_torrents(query, self._selected_sites)
                 self._logger.info(f"  ├─ 收到结果: {len(results) if results else 0} 条，进入二次校验...")
                 
-                best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
-                if best_torrent: 
-                    break 
+                if results:
+                    best_torrent, best_diff = self._match_torrent(results, target["size"], target["name"])
+                    if best_torrent: 
+                        break 
             except Exception as e:
                 self._logger.error(f"  ├─ 站点搜索或匹配时发生异常 [{query}]: {e}", exc_info=True)
 
@@ -614,6 +683,7 @@ class SeedRescuer(_PluginBase):
                 self.cache.set("items", items)
                 self.cache.set("stats", stats)
                 self._logger.info(f"  └─ ✔ 找回并推送成功: {target['name']}")
+                self._send_notify("种子找回成功", f"成功找回并推送至下载器：\n{target['name']}\n精准度：{100-best_diff*100:.1f}%")
                 return {"success": True, "message": f"找回成功！精准度: {100-best_diff*100:.1f}%"}
             else:
                 self._logger.warning(f"  └─ ⚠ 找回成功但推送到下载器失败: {msg}")
@@ -689,23 +759,18 @@ class SeedRescuer(_PluginBase):
 
     def _get_existing_torrents(self) -> set:
         names = set()
-        if not self._downloader_name:
-            return names
-            
-        downloader = self.downloader_helper.get_service(name=self._downloader_name)
-        if downloader and downloader.instance:
-            is_inactive = getattr(downloader.instance, 'is_inactive', lambda: False)
-            if not is_inactive():
-                try:
-                    res = downloader.instance.get_torrents()
-                    torrents = res[0] if isinstance(res, tuple) else res
-                    if torrents:
-                        for t in torrents:
-                            t_name = t.get('name') if isinstance(t, dict) else getattr(t, 'name', '')
-                            if t_name:
-                                names.add(t_name)
-                except Exception as e:
-                    self._logger.warning(f"获取下载器当前种子状态时出现问题: {e}")
+        downloader = self.downloader
+        if downloader:
+            try:
+                res = downloader.get_torrents()
+                torrents = res[0] if isinstance(res, tuple) else res
+                if torrents:
+                    for t in torrents:
+                        t_name = t.get('name') if isinstance(t, dict) else getattr(t, 'name', '')
+                        if t_name:
+                            names.add(t_name)
+            except Exception as e:
+                self._logger.warning(f"获取下载器当前种子状态时出现问题: {e}")
         return names
 
     def _match_torrent(self, search_results: List[Any], target_size: int, local_name: str) -> Tuple[Optional[Any], float]:
@@ -713,9 +778,12 @@ class SeedRescuer(_PluginBase):
             return None, 1.0
             
         def get_priority(t):
-            site_id = getattr(t, 'site', getattr(t, 'site_id', ''))
+            if isinstance(t, dict):
+                site_id = t.get('site') or t.get('site_id', '')
+            else:
+                site_id = getattr(t, 'site', getattr(t, 'site_id', ''))
             try: 
-                return self._selected_sites.index(site_id)
+                return self._selected_sites.index(str(site_id))
             except Exception: 
                 return 999
                 
@@ -728,14 +796,19 @@ class SeedRescuer(_PluginBase):
         best_diff = 1.0
         
         for t in sorted_res:
-            t_size = getattr(t, 'size', 0)
-            t_title = getattr(t, 'title', getattr(t, 'name', ''))
-            site_name = getattr(t, 'site_name', getattr(t, 'site', 'Unknown'))
+            if isinstance(t, dict):
+                t_size = t.get('size', 0)
+                t_title = t.get('title') or t.get('name', '')
+                site_name = t.get('site_name') or t.get('site', 'Unknown')
+            else:
+                t_size = getattr(t, 'size', 0)
+                t_title = getattr(t, 'title', getattr(t, 'name', ''))
+                site_name = getattr(t, 'site_name', getattr(t, 'site', 'Unknown'))
             
             if not t_size: 
                 continue
                 
-            diff = abs(t_size - target_size) / target_size
+            diff = abs(float(t_size) - target_size) / target_size
             if diff < best_diff:
                 best_diff = diff
 
@@ -751,12 +824,11 @@ class SeedRescuer(_PluginBase):
                 else:
                     self._logger.info(f"    └─ [⏭ 跳过] 标签不符: {t_title}")
             else:
-                self._logger.info(f"    └─ [⏭ 跳过] 体积不符: {t_title} (远程体积: {self._format_size(t_size)} | 差距: {diff*100:.2f}%)")
+                self._logger.info(f"    └─[⏭ 跳过] 体积不符: {t_title} (远程体积: {self._format_size(t_size)} | 差距: {diff*100:.2f}%)")
                     
         self._logger.info(f"    └─ 无完全匹配项。最小体积误差: {best_diff*100:.2f}%")
         return None, best_diff
 
-    # 解析：处理 MoviePilot 的 base64 代理下载链接
     def _resolve_base64_url(self, url: str) -> str:
         if not url or not url.startswith("["): 
             return url
@@ -778,7 +850,6 @@ class SeedRescuer(_PluginBase):
             self._logger.warning(f"尝试解析 base64 代理链接发生异常: {e}")
         return url
 
-    # 解析：处理 NexusPHP 跳过下载确认页 (letdown=1)
     def _resolve_nexusphp_letdown(self, url: str) -> str:
         if not url or url.startswith("magnet"): 
             return url
@@ -792,16 +863,9 @@ class SeedRescuer(_PluginBase):
             return url
 
     def _download_and_add(self, torrent: Any, local_path: str) -> Tuple[bool, str]:
-        if not self._downloader_name:
-            return False, "未配置下载器"
-            
-        downloader = self.downloader_helper.get_service(name=self._downloader_name)
-        if not downloader or not downloader.instance: 
-            return False, "选定下载器配置不存在或服务未启动"
-            
-        is_inactive = getattr(downloader.instance, 'is_inactive', None)
-        if callable(is_inactive) and is_inactive():
-            return False, "选定下载器当前处于离线状态"
+        downloader = self.downloader
+        if not downloader: 
+            return False, "选定下载器配置不存在或服务未连接"
             
         save_path = str(Path(local_path).parent).replace("\\", "/")
         
@@ -809,17 +873,19 @@ class SeedRescuer(_PluginBase):
             internal, external = self._path_mapping.split(":", 1)
             internal = internal.replace("\\", "/")
             external = external.replace("\\", "/")
-            
             if save_path.startswith(internal):
                 save_path = external + save_path[len(internal):]
 
-        torrent_url = getattr(torrent, 'enclosure', getattr(torrent, 'url', ''))
+        if isinstance(torrent, dict):
+            torrent_url = torrent.get('enclosure') or torrent.get('url', '')
+        else:
+            torrent_url = getattr(torrent, 'enclosure', getattr(torrent, 'url', ''))
         
         torrent_url = self._resolve_base64_url(torrent_url)
         torrent_url = self._resolve_nexusphp_letdown(torrent_url)
         
         try:
-            res = downloader.instance.add_torrent(
+            res = downloader.add_torrent(
                 torrent_url=torrent_url, 
                 save_path=save_path.rstrip("/"), 
                 is_paused=self._only_paused, 
