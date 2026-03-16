@@ -3,7 +3,7 @@
     "name": "种子找回助手",
     "description": "基于特征扫描智能找回种子。支持全特征匹配、关键词校验与风控规避。",
     "labels": "下载管理",
-    "version": "5.3.5",
+    "version": "6.1.1",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png",
     "author": "Gemini",
     "level": 2
