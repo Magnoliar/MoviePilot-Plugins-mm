@@ -5,24 +5,27 @@ import json
 import random
 import threading
 import copy
+import base64
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from app.plugins import _PluginBase
 from app.core.config import settings
 from app.helper.downloader import DownloaderHelper
 from app.helper.sites import SitesHelper
 from app.core.cache import TTLCache
+from app.utils.http import RequestUtils
 
 from apscheduler.triggers.cron import CronTrigger
 
 class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
-    plugin_desc = "基于特征扫描智能找回种子。(v5.2.2 增加全景搜索日志、优化关键词提取与误差宽容度)"
+    plugin_desc = "基于特征扫描智能找回种子。(v5.2.3 支持隐藏已存在项目，吸收社区神级下载链接解析方案)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
-    plugin_version = "5.2.2"  # 核心升级：大幅增强匹配透明度日志、修正状态回写丢失问题、放宽 3% 匹配误差
+    plugin_version = "5.2.3"  # 核心升级：新增隐藏已存在项目开关，融合代理链接解析与 letdown=1 免确认下载
     plugin_author = "Gemini"
     
     auth_level = 1
@@ -33,6 +36,7 @@ class SeedRescuer(_PluginBase):
     _downloader_name = ""
     _cron = ""
     _only_paused = True
+    _hide_existing = True  # 新增：是否隐藏已在下载器中的项目
     _max_depth = 3
     _path_mapping = ""
     _sleep_min = 3
@@ -67,6 +71,7 @@ class SeedRescuer(_PluginBase):
             self._downloader_name = config.get("downloader_name", "")
             self._cron = config.get("cron", "")
             self._only_paused = config.get("only_paused", True)
+            self._hide_existing = config.get("hide_existing", True)
             self._path_mapping = config.get("path_mapping", "")
             
             def safe_int(val, default):
@@ -125,7 +130,7 @@ class SeedRescuer(_PluginBase):
             trigger = CronTrigger.from_crontab(self._cron)
         except Exception as e:
             self._logger.error(f"Cron 表达式解析失败: {e}", exc_info=True)
-            return []
+            return[]
 
         return[{
             "id": "seed_rescuer_auto_task",
@@ -135,9 +140,6 @@ class SeedRescuer(_PluginBase):
             "kwargs": {}
         }]
 
-    # ==========================
-    #  本地持久化记录
-    # ==========================
     def _load_history(self) -> Dict[str, bool]:
         if self._history_file.exists():
             try: 
@@ -187,14 +189,15 @@ class SeedRescuer(_PluginBase):
                     "content":[
                         {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 6, "xs": 12}, "content":[{"component": "VSwitch", "props": {"model": "enabled", "label": "启用定时任务", "hint": "插件总开关：启动后根据设定的周期在后台自动执行找回任务。"}}] },
                         {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 6, "xs": 12}, "content":[{"component": "VTextField", "props": {"model": "cron", "label": "自动周期", "placeholder": "0 2 * * *", "hint": "设置后台全量自动化找回的周期（支持5位 Cron 表达式）。"}}] },
-                        {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 6, "xs": 12}, "content":[{"component": "VTextField", "props": {"model": "max_depth", "label": "扫描深度", "type": "number", "hint": "从指定根目录向下扫描文件层级的最大深度（推荐为3）。"}}] }
+                        {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 6, "xs": 12}, "content":[{"component": "VSwitch", "props": {"model": "hide_existing", "label": "隐藏已存在的项目", "hint": "开启后，下方的找回清单表格将不再展示已存在于下载器中的项目，保持界面清爽（极其推荐）。"}}] }
                     ]
                 },
                 {
                     "component": "VRow",
                     "content":[
-                        {"component": "VCol", "props": {"cols": 12, "xxl": 6, "xl": 6, "lg": 6, "md": 6, "sm": 12, "xs": 12}, "content":[{"component": "VTextField", "props": {"model": "scan_path", "label": "待扫描路径", "placeholder": "/media/movies", "hint": "必填。待找回资源的本地存储目录，多个路径请使用英文逗号分隔。"}}] },
-                        {"component": "VCol", "props": {"cols": 12, "xxl": 6, "xl": 6, "lg": 6, "md": 6, "sm": 12, "xs": 12}, "content":[{"component": "VTextField", "props": {"model": "path_mapping", "label": "路径转换映射", "placeholder": "/media:/downloads", "hint": "选填。将容器内路径映射为下载器可视路径，格式为 `容器路径:下载器路径`。"}}] }
+                        {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 12, "xs": 12}, "content":[{"component": "VTextField", "props": {"model": "scan_path", "label": "待扫描路径", "placeholder": "/media/movies", "hint": "必填。待找回资源的本地存储目录，多个路径请使用英文逗号分隔。"}}] },
+                        {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 12, "xs": 12}, "content":[{"component": "VTextField", "props": {"model": "path_mapping", "label": "路径转换映射", "placeholder": "/media:/downloads", "hint": "选填。将容器内路径映射为下载器可视路径，格式为 `容器路径:下载器路径`。"}}] },
+                        {"component": "VCol", "props": {"cols": 12, "xxl": 4, "xl": 4, "lg": 4, "md": 4, "sm": 12, "xs": 12}, "content":[{"component": "VTextField", "props": {"model": "max_depth", "label": "扫描深度", "type": "number", "hint": "从指定根目录向下扫描文件层级的最大深度（推荐为3）。"}}] }
                     ]
                 },
                 {
@@ -234,6 +237,7 @@ class SeedRescuer(_PluginBase):
             "downloader_name": self._downloader_name,
             "cron": self._cron,
             "only_paused": self._only_paused,
+            "hide_existing": self._hide_existing,
             "max_depth": self._max_depth,
             "path_mapping": self._path_mapping,
             "sleep_min": self._sleep_min,
@@ -250,7 +254,6 @@ class SeedRescuer(_PluginBase):
 
         tbody_content =[]
         for item in data_list:
-            # 根据状态着色
             status_text = str(item.get("status", ""))
             status_color = "text-grey"
             if "✨" in status_text:
@@ -279,9 +282,10 @@ class SeedRescuer(_PluginBase):
             })
 
         if not tbody_content:
+            text_hint = "暂无扫描数据" if not self._hide_existing else "暂无需要找回的数据 (已存在的项目已被隐藏)"
             tbody_content.append({
                 "component": "tr",
-                "content":[{"component": "td", "props": {"colspan": 5, "class": "text-center text-grey"}, "text": "暂无扫描数据"}]
+                "content":[{"component": "td", "props": {"colspan": 5, "class": "text-center text-grey"}, "text": text_hint}]
             })
 
         return[
@@ -353,7 +357,7 @@ class SeedRescuer(_PluginBase):
             {"path": "/scan_now", "endpoint": self.scan_now, "methods":["GET"], "summary": "扫描磁盘", "auth": "bear"},
             {"path": "/test_run", "endpoint": self.test_run, "methods": ["GET"], "summary": "灰度测试", "auth": "bear"},
             {"path": "/download_all", "endpoint": self.download_all, "methods":["GET"], "summary": "全量自动化找回", "auth": "bear"},
-            {"path": "/reset_history", "endpoint": self.reset_history, "methods": ["GET"], "summary": "重置找回历史记录", "auth": "bear"},
+            {"path": "/reset_history", "endpoint": self.reset_history, "methods":["GET"], "summary": "重置找回历史记录", "auth": "bear"},
             {"path": "/download_item", "endpoint": self.download_item, "methods": ["GET"], "summary": "手动下载指定的丢失项", "auth": "bear"}
         ]
 
@@ -386,17 +390,23 @@ class SeedRescuer(_PluginBase):
             for base_path in paths:
                 items = self._get_local_items(base_path)
                 for name, path, size in items:
-                    stats["total"] += 1
+                    
                     if name in history:
                         status = "✨ 已找回"
                         stats["rescued"] += 1
+                        stats["total"] += 1
                         conf = "100%"
                     elif name in existing_torrents:
                         status = "✅ 已存在"
                         stats["existing"] += 1
                         conf = "100%"
+                        # 核心特性：如果开启了隐藏已存在的项目，则不再追加进清单表格列表
+                        if self._hide_existing:
+                            continue
+                        stats["total"] += 1
                     else:
                         status = "⏳ 待找回"
+                        stats["total"] += 1
                         conf = "-"
                     
                     all_items.append({
@@ -411,9 +421,11 @@ class SeedRescuer(_PluginBase):
             
             self.cache.set("items", all_items)
             self.cache.set("stats", stats)
-            self.cache.set("status_msg", f"空闲中 (上次扫描完毕，共发现 {len(all_items)} 个特征项目)")
-            self._logger.info(f"磁盘扫描完成，共发现 {len(all_items)} 个符合特征的项")
-            return {"success": True, "message": f"扫描完毕，共发现 {len(all_items)} 个符合特征的影视文件夹/文件。"}
+            
+            msg_suffix = " (已隐藏已存在项目)" if self._hide_existing else ""
+            self.cache.set("status_msg", f"空闲中 (上次扫描完毕，共渲染 {len(all_items)} 个项目{msg_suffix})")
+            self._logger.info(f"磁盘扫描完成，共处理 {len(items)} 个文件，展示 {len(all_items)} 项")
+            return {"success": True, "message": f"扫描完毕，共发现 {len(items)} 个影视资源。"}
         except Exception as e:
             self._logger.error(f"磁盘扫描时发生异常: {e}", exc_info=True)
             self.cache.set("status_msg", "空闲中 (上次扫描发生异常)")
@@ -498,7 +510,6 @@ class SeedRescuer(_PluginBase):
 
         self._logger.info(f"▶ 开始尝试找回: [{target['name']}] (原始体积: {self._format_size(target['size'])})")
 
-        # 核心修复 2: 剔除干扰符号，提高提取纯净关键词成功率
         clean_name = re.sub(r'[\[\]\(\)\{\}\-\_\￡\@]', ' ', target["name"]).replace(".", " ")
         clean_name = re.sub(r'\s+', ' ', clean_name).strip()
 
@@ -510,7 +521,6 @@ class SeedRescuer(_PluginBase):
         if clean_title: 
             search_queries.append(clean_title)
 
-        # 核心修复 1: 增加找回全景日志，让检索过程透明化
         search_queries = list(dict.fromkeys(search_queries))
         self._logger.info(f"  ├─ 生成检索关键词: {search_queries}")
 
@@ -546,7 +556,6 @@ class SeedRescuer(_PluginBase):
                 self._logger.warning(f"  └─ ⚠ 找回成功但推送到下载器失败: {msg}")
                 return {"success": False, "message": f"推送到下载器失败: {msg}"}
         
-        # 核心修复 3: 正确写入匹配失败状态回 UI 并存储
         target["status"] = "❌ 匹配失败"
         target["confidence"] = f"{100-best_diff*100:.1f}%" if best_diff < 1.0 else "0%"
         stats["failed"] += 1
@@ -560,7 +569,6 @@ class SeedRescuer(_PluginBase):
     #  内部辅助方法
     # ==========================
     def _parse_media_name(self, name: str) -> str:
-        # 优化 Title 提取正则，获取最核心片名与年份/季度作为强兜底搜索词
         year_match = re.search(r'[\.\s](19|20)\d{2}[\.\s]', name)
         season_match = re.search(r'[\.\s]S\d{2}[\.\s]', name, re.I)
         
@@ -576,7 +584,6 @@ class SeedRescuer(_PluginBase):
             
         if split_point > 0:
             title = name[:split_point].replace(".", " ").strip()
-            # 同样清理一次特殊符号
             title = re.sub(r'[\[\]\(\)\{\}\-\_\￡\@]', ' ', title)
             title = re.sub(r'\s+', ' ', title).strip()
             return f"{title} {suffix}".strip()
@@ -669,7 +676,6 @@ class SeedRescuer(_PluginBase):
             if diff < best_diff:
                 best_diff = diff
 
-            # 核心修复 4: 宽容误差上调至 3% (0.03)，防止压制组算错体积或NFO丢失导致的一刀切拒绝
             if diff <= 0.03: 
                 tag_match = True
                 for tag in core_tags:
@@ -686,6 +692,41 @@ class SeedRescuer(_PluginBase):
                     
         self._logger.info(f"    └─ 无完全匹配项。最小体积误差: {best_diff*100:.2f}%")
         return None, best_diff
+
+    # 吸收社区优秀代码：处理 MoviePilot 的 base64 代理下载链接
+    def _resolve_base64_url(self, url: str) -> str:
+        if not url or not url.startswith("["): 
+            return url
+        try:
+            m = re.search(r"\[(.*)](.*)", url)
+            if m:
+                base64_str = m.group(1)
+                req_str = base64.b64decode(base64_str.encode('utf-8')).decode('utf-8')
+                req_params = json.loads(req_str)
+                res = RequestUtils().get_res(m.group(2), params=req_params.get('params'))
+                if res and req_params.get('result'):
+                    data = res.json()
+                    for key in str(req_params.get('result')).split("."):
+                        data = data.get(key)
+                    return data if data else url
+                elif res:
+                    return res.text
+        except Exception as e:
+            self._logger.warning(f"尝试解析 base64 代理链接发生异常: {e}")
+        return url
+
+    # 吸收社区优秀代码：处理 NexusPHP 跳过下载确认页
+    def _resolve_nexusphp_letdown(self, url: str) -> str:
+        if not url or url.startswith("magnet"): 
+            return url
+        try:
+            parsed_url = urlparse(url)
+            query_params = dict(parse_qsl(parsed_url.query))
+            query_params["letdown"] = "1"
+            new_query = urlencode(query_params)
+            return str(urlunparse(parsed_url._replace(query=new_query)))
+        except Exception:
+            return url
 
     def _download_and_add(self, torrent: Any, local_path: str) -> Tuple[bool, str]:
         if not self._downloader_name:
@@ -710,6 +751,10 @@ class SeedRescuer(_PluginBase):
                 save_path = external + save_path[len(internal):]
 
         torrent_url = getattr(torrent, 'enclosure', getattr(torrent, 'url', ''))
+        
+        # 核心修复：运用提取的两个链接解析器，最大程度保障种子下载能拿到实际文件而不是一个弹窗网页
+        torrent_url = self._resolve_base64_url(torrent_url)
+        torrent_url = self._resolve_nexusphp_letdown(torrent_url)
         
         try:
             res = downloader.instance.add_torrent(
