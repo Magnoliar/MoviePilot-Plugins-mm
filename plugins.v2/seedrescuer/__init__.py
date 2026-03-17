@@ -21,7 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
-    plugin_desc = "超净版辅种扫描仪。(v6.1.1 TR/QB 全兼容内存直写版)"
+    plugin_desc = "超净版辅种扫描仪。(v6.1.2 流控限制)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
     plugin_version = "6.1.1"  # 核心升级：智能探测下载器类型 (TR/QB)，下发对应的底层专属参数组合 (download_dir / labels)
     plugin_author = "Gemini"
