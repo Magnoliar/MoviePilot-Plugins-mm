@@ -21,7 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 class SeedRescuer(_PluginBase):
     plugin_name = "种子找回助手"
-    plugin_desc = "超净版辅种扫描仪。(v6.1.2 流控限制)"
+    plugin_desc = "超净版辅种扫描仪。(v6.1.3 流控限制)"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/mediasyncdel.png"
     plugin_version = "6.1.1"  # 核心升级：智能探测下载器类型 (TR/QB)，下发对应的底层专属参数组合 (download_dir / labels)
     plugin_author = "Gemini"
@@ -258,6 +258,9 @@ class SeedRescuer(_PluginBase):
         tbody_content =[]
         for item in data_list:
             status_text = str(item.get("status", ""))
+            # 🔥 新增：如果在页面刷新时发现开启了隐藏，直接过滤掉这些健康/已找回的种子
+            if self._hide_existing and status_text in ["✅ 已存在", "✨ 已找回", "✨ 找回成功"]:
+                continue
             status_color = "text-grey"
             if "✨" in status_text:
                 status_color = "text-success font-weight-bold"
@@ -317,6 +320,7 @@ class SeedRescuer(_PluginBase):
                         {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-magnify"}, "text": "全盘扫描", "events": {"click": {"api": "plugin/SeedRescuer/scan_now", "method": "get"}}},
                         {"component": "VBtn", "props": {"color": "warning", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-test-tube"}, "text": "灰度测试", "events": {"click": {"api": "plugin/SeedRescuer/test_run", "method": "get"}}},
                         {"component": "VBtn", "props": {"color": "success", "variant": "tonal", "class": "mr-3 mb-2", "prepend-icon": "mdi-rocket"}, "text": "全量自动找回", "events": {"click": {"api": "plugin/SeedRescuer/download_all", "method": "get"}}},
+                        {"component": "VBtn", "props": {"color": "error", "variant": "flat", "class": "mr-3 mb-2", "prepend-icon": "mdi-stop-circle-outline"}, "text": "强制停止任务", "events": {"click": {"api": "plugin/SeedRescuer/stop_task", "method": "get"}}},
                         {"component": "VBtn", "props": {"color": "error", "variant": "tonal", "class": "mb-2", "prepend-icon": "mdi-delete"}, "text": "重置记录", "events": {"click": {"api": "plugin/SeedRescuer/reset_history", "method": "get"}}}
                     ]}
                 ]
@@ -395,8 +399,18 @@ class SeedRescuer(_PluginBase):
             {"path": "/test_run", "endpoint": self.test_run, "methods": ["GET"], "summary": "灰度测试", "auth": "bear"},
             {"path": "/download_all", "endpoint": self.download_all, "methods":["GET"], "summary": "全量自动化找回", "auth": "bear"},
             {"path": "/reset_history", "endpoint": self.reset_history, "methods":["GET"], "summary": "重置找回历史记录", "auth": "bear"},
-            {"path": "/download_item", "endpoint": self.download_item, "methods": ["GET"], "summary": "手动下载指定的丢失项", "auth": "bear"}
+            {"path": "/download_item", "endpoint": self.download_item, "methods": ["GET"], "summary": "手动下载指定的丢失项", "auth": "bear"},
+            {"path": "/stop_task", "endpoint": self.stop_task, "methods": ["GET"], "summary": "手动停止正在运行的后台任务", "auth": "bear"}
         ]
+    
+    def stop_task(self):
+        """手动触发停止信号"""
+        if not self._exit_event.is_set():
+            self._exit_event.set()
+            self._logger.info("收到手动中止指令，正在紧急制动后台任务...")
+            self.cache.set("status_msg", "空闲中 (任务已被手动中止)")
+            return {"success": True, "message": "已发送中止指令，后台任务将在当前种子处理完毕后立即停止。"}
+        return {"success": False, "message": "当前没有正在运行的后台任务。"}
 
     def reset_history(self):
         with self._history_lock:
@@ -428,21 +442,22 @@ class SeedRescuer(_PluginBase):
                 items = self._get_local_items(base_path)
                 for name, path, size in items:
                     
+                    stats["total"] += 1  # 🔥 修复：无论是否隐藏，先给总数+1，保证顶部数据看板永远准确
+                    
                     if name in history:
                         status = "✨ 已找回"
                         stats["rescued"] += 1
-                        stats["total"] += 1
                         conf = "100%"
+                        if self._hide_existing:  # 🔥 新增：判断隐藏开关
+                            continue
                     elif name in existing_torrents:
                         status = "✅ 已存在"
                         stats["existing"] += 1
                         conf = "100%"
-                        if self._hide_existing:
+                        if self._hide_existing:  # 原有的隐藏判断
                             continue
-                        stats["total"] += 1
                     else:
                         status = "⏳ 待找回"
-                        stats["total"] += 1
                         conf = "-"
                     
                     all_items.append({
@@ -474,6 +489,7 @@ class SeedRescuer(_PluginBase):
             return {"success": False, "message": "已有任务正在运行中，请稍后再试"}
             
         try:
+            self._exit_event.clear()  # 🔥 新增：每次启动新任务前，先把刹车松开
             self.scan_now()
             cached_items = self.cache.get("items") or []
             items =[i for i in cached_items if "待找回" in i.get("status", "")][:5]
@@ -512,6 +528,7 @@ class SeedRescuer(_PluginBase):
             return {"success": False, "message": "已有任务正在运行中，请稍后再试"}
             
         try:
+            self._exit_event.clear()  # 🔥 新增：每次启动新任务前，先把刹车松开
             cached_items = self.cache.get("items") or[]
             to_do =[i for i in cached_items if "待找回" in i.get("status", "")]
             
