@@ -39,8 +39,8 @@ class SeedRescuer(_PluginBase):
     _hide_existing = True
     _max_depth = 3
     _path_mapping = ""
-    _sleep_min = 3
-    _sleep_max = 8
+    _sleep_min = 45
+    _sleep_max = 90
     
     _history_file = Path(settings.PLUGIN_DATA_PATH) / "seed_rescuer_history.json"
     
@@ -81,8 +81,8 @@ class SeedRescuer(_PluginBase):
                     return default
 
             self._max_depth = safe_int(config.get("max_depth"), 3)
-            self._sleep_min = safe_int(config.get("sleep_min"), 3)
-            self._sleep_max = safe_int(config.get("sleep_max"), 8)
+            self._sleep_min = safe_int(config.get("sleep_min"), 45)
+            self._sleep_max = safe_int(config.get("sleep_max"), 90)
 
     def _setup_logger(self):
         log_dir = Path(getattr(settings, "LOG_PATH", "/moviepilot/logs")) / "plugins"
@@ -610,8 +610,14 @@ class SeedRescuer(_PluginBase):
         best_torrent = None
         best_diff = 1.0
         
-        for query in search_queries: 
+        for idx, query in enumerate(search_queries): 
             if not query: continue
+            
+            # 🔥 核心修复：如果不是第一次查询（即尝试变种词），强制冷却 15 秒，规避馒头并发限制
+            if idx > 0:
+                self._logger.info("  ├─ [API 限流保护] 冷却中：等待 15 秒后发起变种词检索...")
+                time.sleep(15)
+                
             try:
                 self._logger.info(f"  ├─ 直连 Prowlarr 引擎发起纯净搜索: '{query}'")
                 results = self._search_prowlarr(query)
