@@ -37,4 +37,55 @@
 - 本插件默认以 **“强行暂停”** 状态向下载器底层注入种子。只要你的“保存路径”指向了被扫描电影文件夹的**上一级目录**，QB/TR 右键点击“强制校验”即可秒速恢复做种。
 - 若校验进度条卡在 0% 重新下载，请立刻删除任务！这通常意味着你下载了非原压制组版本，或路径配置错误，继续下载将覆盖你的本地原文件！
 
-***
+
+### 🛠️ 附录：Prowlarr 极速部署与防封配置指南
+
+如果你还没有部署 Prowlarr（全能索引器），或者不知道如何将其与本插件完美对接，请参考以下精简指南：
+
+#### 1. Docker Compose 一键部署
+在你的 NAS 或服务器上创建一个 `docker-compose.yml` 文件，填入以下内容并执行 `docker-compose up -d` 启动：
+
+```yaml
+version: '3.3'
+services:
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+      - PUID=1000      # 修改为你的用户UID
+      - PGID=1000      # 修改为你的用户组GID
+      - TZ=Asia/Shanghai
+    volumes:
+      - /你的本地路径/prowlarr/config:/config  # 替换为实际存储配置的目录
+    ports:
+      - 9696:9696
+    restart: unless-stopped
+```
+
+#### 2. 添加 PT 站点 (以 M-Team 为例)
+1. 浏览器访问 `http://你的NAS_IP:9696` 进入 Prowlarr。
+2. 首次进入需设置无认证或账号密码登录。
+3. 点击左侧菜单 **Indexers** -> 点击顶部 **+ Add Indexer**。
+4. 搜索你要添加的站点（如 `M-Team`），推荐在鉴权方式选择 **API Key**（去 M-Team 控制台 -> 安全 -> 实验室获取 API 密钥）而不是 Cookie，稳定性极高。
+5. 点击 **Test**，测试通过后点击 **Save**。
+
+#### 3. 🛡️ 极其关键：设置防封限流 (Rate Limit)
+*PT 站点（如 M-Team）通常对 API 搜索有严格的 1000次/24小时 限制，若不限制 Prowlarr，几分钟内就会被关小黑屋导致 503 报错！*
+1. 在 Prowlarr 顶部菜单点击 **⚙️ Settings**，将顶部的 **Show Advanced**（显示高级设置）切换为开启状态。
+2. 回到 **Indexers** 页面，点击你刚添加的 M-Team 右侧的 **扳手图标 (Edit)**。
+3. 在弹出的设置窗口往下滚，找到 **Query Limit (查询限制)** 和 **Limit Unit (限制单位)**。
+4. 强烈建议设置为：
+   - **Query Limit**: `600`
+   - **Limit Unit**: `Hours (1)`
+   *(这意味着限制每小时最多向站点发起 600 次搜索请求，完美保护你的账号)*
+5. **Grab Limit (抓取限制)** 留空即可。点击保存。
+
+#### 4. 对接 SeedRescuer 插件
+1. 在 Prowlarr 左侧菜单点击 **Settings** -> **General**。
+2. 在 **Security (安全)** 栏目下，找到 **API Key**。
+3. 复制这串长长的字符。
+4. 回到 MoviePilot -> 插件 -> SeedRescuer 种子找回助手设置页：
+   - **Prowlarr 检索源 URL**: 填入 `http://你的NAS_IP:9696`
+   - **Prowlarr API Key**: 贴入你刚复制的字符。
+5. 保存配置，尽情享受全量自动化找回的快感吧！
+
