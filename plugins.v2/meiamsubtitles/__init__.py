@@ -10,9 +10,14 @@ from urllib import parse, request
 
 from app.core.cache import TTLCache
 from app.core.config import settings
-from app.events import EventType, eventmanager
 from app.plugins import _PluginBase
 from app.schemas import NotificationType
+
+try:
+    from app.events import EventType, eventmanager
+except ImportError:
+    from app.core.event import eventmanager
+    from app.schemas.types import EventType
 
 
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts", ".webm", ".iso"}
