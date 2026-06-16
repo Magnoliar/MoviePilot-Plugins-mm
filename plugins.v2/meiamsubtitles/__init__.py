@@ -72,7 +72,7 @@ class MeiamSubtitles(_PluginBase):
     plugin_name = "Meiam 自动字幕"
     plugin_desc = "入库后自动从射手网、迅雷看看、SubHD、Zimuku 下载同名字幕"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosubtitles.jpeg"
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     plugin_author = "Meiam/mm"
     auth_level = 1
 
@@ -99,6 +99,7 @@ class MeiamSubtitles(_PluginBase):
     def init_plugin(self, config: dict = None):
         self.cache = TTLCache(region="MeiamSubtitles", maxsize=500, ttl=86400)
         self._setup_logger()
+        self._check_dependencies()
 
         if config:
             self._enabled = config.get("enabled", False)
@@ -118,6 +119,23 @@ class MeiamSubtitles(_PluginBase):
             self._ai_api_key = config.get("ai_api_key", "")
             self._ai_timeout = self._safe_int(config.get("ai_timeout"), 20)
             self._ai_top_n = self._safe_int(config.get("ai_top_n"), 5)
+
+    def _check_dependencies(self):
+        """检查必要的 Python 依赖是否已安装"""
+        missing = []
+        try:
+            import requests  # noqa: F401
+        except ImportError:
+            missing.append("requests")
+        try:
+            import bs4  # noqa: F401
+        except ImportError:
+            missing.append("beautifulsoup4")
+        if missing:
+            self._logger.error("缺少依赖: %s — SubHD/Zimuku 搜索将不可用，请安装: pip install %s",
+                ", ".join(missing), " ".join(missing))
+        else:
+            self._logger.info("依赖检查通过 (requests, beautifulsoup4)")
 
     def _setup_logger(self):
         log_dir = Path(getattr(settings, "LOG_PATH", "/moviepilot/logs")) / "plugins"
@@ -993,50 +1011,71 @@ class MeiamSubtitles(_PluginBase):
     # ── SubHD 字幕源 ────────────────────────────────────────────────
 
     def _search_subhd(self, video: Path, language: str, douban_info: Optional[Dict] = None) -> List[SubtitleCandidate]:
-        """从 SubHD 搜索字幕"""
-        if not douban_info:
-            self._logger.info("SubHD: 无豆瓣信息，跳过搜索")
-            return []
+        """从 SubHD 搜索字幕（优先用豆瓣 ID，回退用标题搜索）"""
         session = None
         try:
             import requests as _requests
             session = _requests.Session()
             session.headers.update(DEFAULT_HEADERS)
 
-            douban_id = douban_info.get("id")
-            self._logger.info("SubHD: 搜索豆瓣 ID %s", douban_id)
-            search_url = f"https://subhd.tv/search/{douban_id}"
-            resp = session.get(search_url, timeout=self._timeout)
-            if resp.status_code != 200:
-                self._logger.warning("SubHD: 搜索页 HTTP %s", resp.status_code)
+            search_id = None
+            if douban_info:
+                search_id = douban_info.get("id")
+                self._logger.info("SubHD: 尝试豆瓣 ID %s", search_id)
+
+            # 策略 1: 用豆瓣 ID 搜索
+            detail_url = None
+            if search_id:
+                resp = session.get(f"https://subhd.tv/search/{search_id}", timeout=self._timeout)
+                if resp.status_code == 200:
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    container = soup.select_one("div.col-lg-9")
+                    if container:
+                        link = container.select_one('a[href*="/d/"]')
+                        if link:
+                            m = re.search(r"/d/(\w+)", link.get("href", ""))
+                            if m:
+                                detail_url = f"https://subhd.tv/d/{m.group(1)}"
+                                self._logger.info("SubHD: 豆瓣 ID 映射到 %s", detail_url)
+
+            # 策略 2: 用标题搜索（回退）
+            if not detail_url:
+                title = self._extract_title(video) if not douban_info else None
+                if not title and douban_info:
+                    title = douban_info.get("title", "").split("(")[0].strip()
+                if not title:
+                    title = self._extract_title(video)
+                if title:
+                    self._logger.info("SubHD: 标题搜索 '%s'", title)
+                    resp = session.get(f"https://subhd.tv/search/{parse.quote(title)}", timeout=self._timeout)
+                    if resp.status_code == 200:
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(resp.text, "html.parser")
+                        container = soup.select_one("div.col-lg-9")
+                        if container:
+                            link = container.select_one('a[href*="/d/"]')
+                            if link:
+                                m = re.search(r"/d/(\w+)", link.get("href", ""))
+                                if m:
+                                    detail_url = f"https://subhd.tv/d/{m.group(1)}"
+
+            if not detail_url:
+                self._logger.info("SubHD: 未找到字幕页")
                 return []
 
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(resp.text, "html.parser")
-            container = soup.select_one("div.col-lg-9")
-            if not container:
-                self._logger.info("SubHD: 搜索页无结果容器")
-                return []
-
-            link = container.select_one('a[href^="/d/"]')
-            if not link:
-                self._logger.info("SubHD: 未找到字幕页链接")
-                return []
-
-            m = re.search(r"/d/(\d+)", link.get("href", ""))
-            if not m:
-                return []
-
-            detail_id = m.group(1)
-            detail_url = f"https://subhd.tv/d/{detail_id}"
+            self._logger.info("SubHD: 字幕页 %s", detail_url)
             resp = session.get(detail_url, timeout=self._timeout)
             if resp.status_code != 200:
-                self._logger.warning("SubHD: 字幕列表页 HTTP %s", resp.status_code)
+                self._logger.warning("SubHD: 字幕页 HTTP %s", resp.status_code)
                 return []
 
-            results = self._parse_subhd_subtitles(resp.text, video, douban_info)
+            results = self._parse_subhd_subtitles(resp.text, video, douban_info or {})
             self._logger.info("SubHD: 找到 %d 条字幕", len(results))
             return results
+        except ImportError as err:
+            self._logger.error("SubHD 搜索缺少依赖: %s", err)
+            return []
         except Exception as err:
             self._logger.warning("SubHD 搜索失败: %s", err)
             return []
@@ -1294,10 +1333,7 @@ class MeiamSubtitles(_PluginBase):
     # ── Zimuku 字幕源 ───────────────────────────────────────────────
 
     def _search_zimuku(self, video: Path, language: str, douban_info: Optional[Dict] = None) -> List[SubtitleCandidate]:
-        """从 Zimuku 搜索字幕"""
-        if not douban_info:
-            self._logger.info("Zimuku: 无豆瓣信息，跳过搜索")
-            return []
+        """从 Zimuku 搜索字幕（优先用豆瓣 ID，回退用标题）"""
         session = None
         try:
             import requests as _requests
@@ -1305,9 +1341,17 @@ class MeiamSubtitles(_PluginBase):
             session.headers.update(DEFAULT_HEADERS)
             session.mount("https://", _requests.adapters.HTTPAdapter(max_retries=3))
 
-            douban_id = douban_info.get("id")
-            self._logger.info("Zimuku: 搜索豆瓣 ID %s", douban_id)
-            search_url = f"https://zimuku.org/search?q={parse.quote(str(douban_id))}&chost=zimuku.org"
+            search_query = None
+            if douban_info:
+                search_query = str(douban_info.get("id", ""))
+                self._logger.info("Zimuku: 搜索豆瓣 ID %s", search_query)
+            if not search_query:
+                search_query = self._extract_title(video)
+                self._logger.info("Zimuku: 标题搜索 '%s'", search_query)
+            if not search_query:
+                return []
+
+            search_url = f"https://zimuku.org/search?q={parse.quote(search_query)}&chost=zimuku.org"
             resp = self._zimuku_get_page(session, search_url)
             if not resp:
                 self._logger.info("Zimuku: 搜索页无响应")
@@ -1349,6 +1393,9 @@ class MeiamSubtitles(_PluginBase):
                     results.append(info)
             self._logger.info("Zimuku: 找到 %d 条字幕", len(results))
             return results
+        except ImportError as err:
+            self._logger.error("Zimuku 搜索缺少依赖: %s", err)
+            return []
         except Exception as err:
             self._logger.warning("Zimuku 搜索失败: %s", err)
             return []
