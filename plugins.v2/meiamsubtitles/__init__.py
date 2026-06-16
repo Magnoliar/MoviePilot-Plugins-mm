@@ -1,11 +1,18 @@
+import base64
 import hashlib
+import html
 import json
 import logging
+import os
 import random
 import re
+import ssl
+import struct
+import tempfile
 import threading
 import time
-from dataclasses import dataclass
+import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib import parse, request
@@ -24,6 +31,8 @@ except ImportError:
 
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts", ".webm", ".iso"}
 SUBTITLE_EXTS = {"ass", "ssa", "srt"}
+SUBTITLE_EXTS_TUPLE = (".srt", ".sub", ".smi", ".ssa", ".ass", ".sup")
+ARCHIVE_EXTS = (".zip", ".7z", ".tar", ".bz2", ".rar", ".gz", ".xz", ".iso", ".tgz", ".tbz2", ".cbr")
 LANG_ALIASES = {
     "zh": "chi",
     "zh-cn": "chi",
@@ -39,6 +48,12 @@ LANG_ALIASES = {
 }
 LANG_SUFFIX = {"chi": "zh-CN", "eng": "en"}
 
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
 
 @dataclass
 class SubtitleCandidate:
@@ -49,20 +64,22 @@ class SubtitleCandidate:
     language: str
     score: float = 0
     hash_match: bool = False
+    detail_url: str = ""
+    tags: Dict[str, Any] = field(default_factory=dict)
 
 
 class MeiamSubtitles(_PluginBase):
     plugin_name = "Meiam 自动字幕"
-    plugin_desc = "入库后自动从射手网、迅雷看看下载同名字幕"
+    plugin_desc = "入库后自动从射手网、迅雷看看、SubHD、Zimuku 下载同名字幕"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosubtitles.jpeg"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "Meiam/mm"
     auth_level = 1
 
     _enabled = False
     _notify = True
     _overwrite = False
-    _sources = "shooter,thunder"
+    _sources = "shooter,thunder,subhd,zimuku"
     _languages = "chi"
     _max_depth = 2
     _min_size_mb = 50
@@ -87,7 +104,7 @@ class MeiamSubtitles(_PluginBase):
             self._enabled = config.get("enabled", False)
             self._notify = config.get("notify", True)
             self._overwrite = config.get("overwrite", False)
-            self._sources = config.get("sources", "shooter,thunder")
+            self._sources = config.get("sources", "shooter,thunder,subhd,zimuku")
             self._languages = config.get("languages", "chi")
             self._max_depth = self._safe_int(config.get("max_depth"), 2)
             self._min_size_mb = self._safe_int(config.get("min_size_mb"), 50)
@@ -202,8 +219,10 @@ class MeiamSubtitles(_PluginBase):
                                             "items": [
                                                 {"title": "射手网", "value": "shooter"},
                                                 {"title": "迅雷看看", "value": "thunder"},
+                                                {"title": "SubHD", "value": "subhd"},
+                                                {"title": "Zimuku", "value": "zimuku"},
                                             ],
-                                            "hint": "推荐同时启用，射手支持中文/英文，迅雷主要支持中文。",
+                                            "hint": "推荐同时启用所有来源。射手/迅雷通过文件哈希匹配；SubHD/Zimuku 通过豆瓣元数据精确搜索，资源更丰富。",
                                         },
                                     }
                                 ],
@@ -721,7 +740,15 @@ class MeiamSubtitles(_PluginBase):
             return False, "未搜索到字幕"
 
         best = candidates[0]
-        content = self._http_bytes(best.url)
+
+        # SubHD 和 Zimuku 使用专用下载方法
+        if best.source == "SubHD":
+            content = self._download_subhd(best)
+        elif best.source == "Zimuku":
+            content = self._download_zimuku(best)
+        else:
+            content = self._http_bytes(best.url)
+
         if not content:
             self._record(video, language, best.source, "下载失败", best.url)
             return False, "字幕下载失败"
@@ -739,10 +766,19 @@ class MeiamSubtitles(_PluginBase):
         if "thunder" in sources and language == "chi":
             candidates.extend(self._search_thunder(video, language))
 
+        # SubHD/Zimuku 使用豆瓣元数据精确搜索
+        need_douban = ("subhd" in sources or "zimuku" in sources) and language == "chi"
+        douban_info = self._search_douban(video) if need_douban else None
+        if "subhd" in sources and language == "chi":
+            candidates.extend(self._search_subhd(video, language, douban_info))
+        if "zimuku" in sources and language == "chi":
+            candidates.extend(self._search_zimuku(video, language, douban_info))
+
         sorted_candidates = sorted(
             candidates,
             key=lambda item: (
                 item.hash_match,
+                self._lang_tier(item),
                 self._name_similarity(video.name, item.name),
                 self._quality_score(item.name),
                 self._format_priority(item.ext),
@@ -842,6 +878,704 @@ class MeiamSubtitles(_PluginBase):
                 )
             )
         return results
+
+    # ── 豆瓣元数据解析 ──────────────────────────────────────────────
+
+    def _search_douban(self, video: Path) -> Optional[Dict[str, Any]]:
+        """通过豆瓣解析影片元数据，返回 {id, title, year, type} 或 None"""
+        title = self._extract_title(video)
+        if not title:
+            return None
+        queries = [title]
+        if video.parent.name:
+            parent_title = re.sub(r"(?i)\b(season\s*\d+|s\d+|第.季)\b", "", video.parent.name).strip()
+            if parent_title and parent_title != title:
+                queries.insert(0, parent_title)
+        for query in queries:
+            result = self._douban_search(query)
+            if result:
+                return result
+        return None
+
+    def _douban_search(self, query: str) -> Optional[Dict[str, Any]]:
+        """搜索豆瓣并返回第一个匹配结果"""
+        ssl_ctx = ssl._create_unverified_context()
+        headers = {
+            **DEFAULT_HEADERS,
+            "Referer": "https://movie.douban.com/",
+        }
+        for page in range(3):
+            params = {"search_text": query, "cat": "1002", "start": str(page * 15)}
+            url = f"https://search.douban.com/movie/subject_search?{parse.urlencode(params)}"
+            try:
+                req = request.Request(url, headers=headers)
+                with request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
+                    if resp.status != 200:
+                        break
+                    html_text = resp.read().decode("utf-8", errors="ignore")
+            except Exception:
+                break
+
+            match = re.search(r"window\.__DATA__\s*=\s*({.+?});", html_text, re.DOTALL)
+            if not match:
+                continue
+            try:
+                data = json.loads(match.group(1).strip())
+            except Exception:
+                continue
+
+            for item in data.get("items", []):
+                if item.get("tpl_name") != "search_subject":
+                    continue
+                sid = item.get("id")
+                if not sid:
+                    continue
+                full_title = item.get("title", "").strip()
+                year_match = re.search(r"\((\d{4})\)", full_title)
+                year = year_match.group(1) if year_match else None
+                more_url = item.get("more_url", "")
+                res_type = "tv" if "is_tv:'1'" in more_url else "movie"
+                return {"id": str(sid), "title": full_title, "year": year, "type": res_type}
+        return None
+
+    @staticmethod
+    def _extract_title(video: Path) -> str:
+        """从文件名提取影片标题（去除年份、编码信息等）"""
+        name = video.stem
+        # 去除常见标签
+        name = re.sub(r"[\.\-_]?(1080[pi]|720p|2160p|4K|BluRay|BDRip|WEBRip|HDRip|DVDRip|H\.?264|H\.?265|HEVC|x264|x265|AAC|DTS|FLAC|AC3|REMUX|AMZN|NF|ATVP|DSNP)", "", name, flags=re.IGNORECASE)
+        name = re.sub(r"[\.\-_]?(S\d{1,2}E\d{1,3}|E\d{1,3}|EP\d{1,3})", "", name, flags=re.IGNORECASE)
+        name = re.sub(r"[\.\-_]?\d{4}", "", name)
+        # 用点、下划线、空格分隔取第一段
+        parts = re.split(r"[\.\_\s]+", name.strip())
+        title = " ".join(p for p in parts if p and not re.match(r"^[\[\(\{]", p))[:50]
+        return title.strip()
+
+    # ── SubHD 字幕源 ────────────────────────────────────────────────
+
+    def _search_subhd(self, video: Path, language: str, douban_info: Optional[Dict] = None) -> List[SubtitleCandidate]:
+        """从 SubHD 搜索字幕"""
+        if not douban_info:
+            return []
+        try:
+            import requests as _requests
+            session = _requests.Session()
+            session.headers.update(DEFAULT_HEADERS)
+
+            douban_id = douban_info.get("id")
+            search_url = f"https://subhd.tv/search/{douban_id}"
+            resp = session.get(search_url, timeout=self._timeout)
+            if resp.status_code != 200:
+                return []
+
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(resp.text, "html.parser")
+            container = soup.select_one("div.col-lg-9")
+            if not container:
+                return []
+
+            link = container.select_one('a[href^="/d/"]')
+            if not link:
+                return []
+
+            m = re.search(r"/d/(\d+)", link.get("href", ""))
+            if not m:
+                return []
+
+            detail_id = m.group(1)
+            detail_url = f"https://subhd.tv/d/{detail_id}"
+            resp = session.get(detail_url, timeout=self._timeout)
+            if resp.status_code != 200:
+                return []
+
+            return self._parse_subhd_subtitles(resp.text, video, douban_info)
+        except Exception as err:
+            self._logger.warning("SubHD 搜索失败: %s", err)
+            return []
+
+    def _parse_subhd_subtitles(self, html_text: str, video: Path, douban_info: Dict) -> List[SubtitleCandidate]:
+        """解析 SubHD 字幕列表页面"""
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_text, "html.parser")
+        container = soup.select_one("div.bg-white.shadow-sm.rounded-3.mb-5")
+        if not container:
+            return []
+
+        results = []
+        category = "general"
+        for child in container.children:
+            if not hasattr(child, "name") or child.name != "div":
+                continue
+            classes = child.get("class", [])
+            if "bg-light" in classes:
+                text = child.get_text().strip()
+                if "合集" in text:
+                    category = "collection"
+                elif "第" in text and "集" in text:
+                    match = re.search(r"第\s*(\d+)\s*集", text)
+                    category = int(match.group(1)) if match else "general"
+                else:
+                    category = "general"
+            elif "row" in classes:
+                tags = self._extract_subhd_tags(child.find_all("span"))
+                link = child.select_one("a.link-dark")
+                if not link:
+                    continue
+                href = link.get("href", "")
+                if not href.startswith("/a/"):
+                    continue
+
+                # 剧集过滤
+                episode = self._extract_episode(video)
+                if episode and category != "collection":
+                    if isinstance(category, int) and category != episode:
+                        continue
+
+                if category == "collection":
+                    tags["collection"] = True
+
+                prod = "剧集" if douban_info.get("type") == "tv" else "电影"
+                tags["production"] = prod
+
+                zu = child.select_one('a[href^="/zu/"]') or child.select_one('a[href^="/u/"]')
+                if zu:
+                    tags["fansub"] = zu.get_text().strip()
+
+                name = link.get_text().strip()
+                ext = self._extract_format_from_tags(tags.get("fmt", []))
+                lang = "chi" if any(l in tags.get("lang", []) for l in ("chs", "cht")) else "eng"
+
+                results.append(SubtitleCandidate(
+                    source="SubHD",
+                    name=f"[SubHD] {name}",
+                    url=f"https://subhd.tv{href}",
+                    ext=ext or "srt",
+                    language=lang,
+                    score=80,
+                    detail_url=f"https://subhd.tv{href}",
+                    tags=tags,
+                ))
+        return results
+
+    @staticmethod
+    def _extract_subhd_tags(spans) -> Dict[str, Any]:
+        """从 SubHD span 元素提取标签"""
+        tags = {"source": [], "lang": [], "fmt": [], "bilingual": False}
+        for span in spans:
+            classes = span.get("class", [])
+            text = span.get_text().strip()
+            if "rounded" in classes and "text-white" in classes:
+                src_map = {"转载精修": "reprint", "官方字幕": "official", "原创翻译": "original", "机器翻译": "machine", "AI翻润色": "ai"}
+                for k, v in src_map.items():
+                    if k in text:
+                        tags["source"].append(v)
+                        break
+            if "fw-bold" in classes:
+                if "简体" in text:
+                    tags["lang"].append("chs")
+                if "繁体" in text:
+                    tags["lang"].append("cht")
+                if "英语" in text:
+                    tags["lang"].append("eng")
+                if "双语" in text:
+                    tags["bilingual"] = True
+            if "text-secondary" in classes:
+                for fmt in ("ASS", "SRT", "SSA", "SUB", "SUP", "VTT"):
+                    if fmt in text.upper():
+                        tags["fmt"].append(fmt.lower())
+                        break
+        return tags
+
+    def _download_subhd(self, candidate: SubtitleCandidate) -> Optional[bytes]:
+        """下载 SubHD 字幕（处理验证码）"""
+        try:
+            import requests as _requests
+            session = _requests.Session()
+            session.headers.update(DEFAULT_HEADERS)
+
+            detail_url = candidate.detail_url or candidate.url
+            resp = session.get(detail_url, timeout=self._timeout)
+            if resp.status_code != 200:
+                return None
+
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            down_btn = soup.find("a", class_="down")
+            if not down_btn:
+                for a in soup.find_all("a", href=True):
+                    if "/down/" in a["href"]:
+                        down_btn = a
+                        break
+            if not down_btn:
+                return None
+
+            down_url = down_btn["href"]
+            if not down_url.startswith("http"):
+                down_url = f"https://subhd.tv{down_url}"
+
+            session.get(down_url, headers={"Referer": detail_url}, timeout=self._timeout)
+            sid = down_url.split("/")[-1]
+
+            api_url = "https://subhd.tv/api/sub/down"
+            payload = {"sid": sid, "cap": ""}
+            res = session.post(api_url, json=payload, headers={"Referer": down_url}, timeout=10)
+            if res.status_code != 200:
+                return None
+            data = res.json()
+
+            if data.get("pass") is False:
+                svg = data.get("msg")
+                if svg:
+                    code = self._solve_subhd_captcha(svg)
+                    payload["cap"] = code
+                    res = session.post(api_url, json=payload, headers={"Referer": down_url}, timeout=10)
+                    data = res.json()
+                    if not data.get("success"):
+                        return None
+
+            if not data.get("success"):
+                return None
+
+            file_url = data.get("url")
+            if not file_url:
+                return None
+            if not file_url.startswith("http"):
+                file_url = f"https://subhd.tv{file_url}"
+
+            file_res = session.get(file_url, headers={"Referer": down_url}, timeout=15)
+            if file_res.status_code != 200:
+                return None
+
+            return self._unpack_subtitle_data(file_res.content, file_res.headers, file_url)
+        except Exception as err:
+            self._logger.warning("SubHD 下载失败: %s", err)
+            return None
+
+    @staticmethod
+    def _solve_subhd_captcha(svg_content: str) -> str:
+        """解决 SubHD SVG 验证码"""
+        LENGTH_MAP = {
+            986: "I", 998: "1", 1068: "I", 1081: "1", 1082: "v",
+            1130: "Y", 1134: "Y", 1172: "v", 1224: "Y", 1274: "L",
+            1298: "V", 1311: "V", 1360: "i", 1380: "L", 1406: "V",
+            1473: "i", 1478: "T", 1491: "r", 1598: "N", 1601: "T",
+            1604: "X", 1610: "J", 1613: "x", 1614: "N", 1615: "r",
+            1616: "N", 1617: "N", 1618: "N", 1634: "k", 1637: "k",
+            1694: "z", 1706: "K", 1709: "K", 1731: "X", 1744: "x",
+            1754: "F", 1770: "k", 1835: "z", 1838: "u", 1840: "A",
+            1844: "A", 1848: "K", 1850: "Z", 1853: "Z", 1886: "h",
+            1900: "F", 1922: "H", 1928: "H", 1960: "P", 1991: "u",
+            1993: "A", 1996: "D", 2004: "Z", 2018: "w", 2035: "w",
+            2042: "7", 2043: "h", 2080: "j", 2082: "H", 2104: "R",
+            2107: "R", 2123: "P", 2140: "4", 2162: "D", 2164: "O",
+            2183: "w", 2198: "n", 2199: "C", 2200: "C", 2201: "C",
+            2202: "C", 2210: "f", 2212: "7", 2246: "E", 2253: "j",
+            2260: "o", 2272: "d", 2279: "R", 2282: "M", 2294: "U",
+            2301: "U", 2310: "W", 2318: "W", 2321: "M", 2332: "a",
+            2344: "O", 2345: "W", 2346: "W", 2366: "s", 2380: "b",
+            2381: "n", 2382: "0", 2394: "f", 2433: "E", 2448: "o",
+            2461: "d", 2464: "p", 2466: "M", 2485: "U", 2498: "c",
+            2501: "e", 2503: "W", 2512: "q", 2526: "a", 2546: "2",
+            2563: "s", 2578: "b", 2580: "0", 2606: "5", 2632: "6",
+            2669: "p", 2706: "c", 2709: "e", 2721: "q", 2758: "2",
+            2800: "9", 2823: "5", 2851: "6", 3033: "9", 3038: "S",
+            3054: "B", 3160: "g", 3244: "Q", 3254: "Q", 3266: "G",
+            3291: "S", 3308: "B", 3414: "8", 3423: "g", 3514: "Q",
+            3538: "G", 3663: "m", 3667: "m", 3698: "8", 3878: "3",
+            3968: "m", 4201: "3",
+        }
+
+        def get_all_xy(path):
+            return [float(m) for m in re.findall(r"(\d+(?:\.\d*)?)", path)]
+
+        def resolve_collision(length, path):
+            vals = get_all_xy(path)
+            xs = vals[0::2]
+            ys = vals[1::2]
+            if not xs:
+                return None
+            min_y = min(ys)
+            move_match = re.search(r"M(\d+(?:\.\d*)?)\s+(\d+(?:\.\d*)?)", path)
+            move_y = float(move_match.group(2)) if move_match else 0.0
+            w = max(xs) - min(xs)
+            if length in (986, 1068):
+                return "I" if min_y > 13 else "l"
+            if length in (1274, 1380):
+                return "y" if move_y > 30 else "L"
+            if length in (1610, 1744):
+                return "x" if min_y > 19 else "J"
+            if length == 1615:
+                return "r" if min_y > 18 else "N"
+            if length in (2198, 2381):
+                return "n" if min_y > 19 else "C"
+            if length == 2318:
+                return "W" if w > 30 else "4"
+            if length in (1598, 1731):
+                return "X" if min_y > 13 else "N"
+            if length in (1694, 1835):
+                return "z" if min_y > 22 else "t"
+            if length == 2279:
+                return "R" if min_y > 13 else "M"
+            return None
+
+        candidates = []
+        for m in re.finditer(r'd="([^"]+)"', svg_content):
+            d = m.group(1)
+            if len(d) > 500:
+                x_match = re.search(r"(\d+(?:\.\d*)?)", d)
+                start_x = float(x_match.group(1)) if x_match else 0.0
+                candidates.append((start_x, d))
+        candidates.sort(key=lambda x: x[0])
+        result = []
+        for _, d in candidates:
+            length = len(d)
+            char = resolve_collision(length, d)
+            if not char:
+                char = LENGTH_MAP.get(length, "")
+            result.append(char)
+        return "".join(result)
+
+    # ── Zimuku 字幕源 ───────────────────────────────────────────────
+
+    def _search_zimuku(self, video: Path, language: str, douban_info: Optional[Dict] = None) -> List[SubtitleCandidate]:
+        """从 Zimuku 搜索字幕"""
+        if not douban_info:
+            return []
+        try:
+            import requests as _requests
+            session = _requests.Session()
+            session.headers.update(DEFAULT_HEADERS)
+            session.mount("https://", _requests.adapters.HTTPAdapter(max_retries=3))
+
+            douban_id = douban_info.get("id")
+            search_url = f"https://zimuku.org/search?q={parse.quote(str(douban_id))}&chost=zimuku.org"
+            resp = self._zimuku_get_page(session, search_url)
+            if not resp:
+                return []
+
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(resp, "html.parser")
+            link = soup.find("a", href=re.compile(r"/subs/\d+\.html"))
+            if not link:
+                return []
+
+            subs_url = parse.urljoin("https://zimuku.org", link.get("href"))
+            resp = self._zimuku_get_page(session, subs_url)
+            if not resp:
+                return []
+
+            soup = BeautifulSoup(resp, "html.parser")
+            box = soup.select_one("div.subs.box.clearfix")
+            if not box or not box.tbody:
+                return []
+
+            subs = box.tbody.find_all("tr")
+            episode = self._extract_episode(video)
+            season = self._extract_season(video)
+            ep_filter = self._build_episode_filter(season, episode)
+            prod = "剧集" if douban_info.get("type") == "tv" else "电影"
+
+            results = []
+            for sub in reversed(subs):
+                include, is_coll = ep_filter(sub.a.text if sub.a else "")
+                if not include:
+                    continue
+                info = self._extract_zimuku_sub_info(sub, prod, is_coll)
+                if info:
+                    results.append(info)
+            return results
+        except Exception as err:
+            self._logger.warning("Zimuku 搜索失败: %s", err)
+            return []
+
+    def _zimuku_get_page(self, session, url: str, max_retries: int = 3) -> Optional[bytes]:
+        """获取 Zimuku 页面，自动处理验证码"""
+        for attempt in range(max_retries + 1):
+            try:
+                resp = session.get(url, timeout=10)
+                if resp.status_code == 200 and b'class="verifyimg"' not in resp.content:
+                    return resp.content
+                if b'class="verifyimg"' in resp.content and attempt < max_retries:
+                    self._solve_zimuku_captcha(session, url, resp.content)
+                    continue
+                if resp.status_code != 200:
+                    return None
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _solve_zimuku_captcha(session, url: str, page_content: bytes):
+        """解决 Zimuku BMP 验证码"""
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(page_content, "html.parser")
+            img = soup.find(attrs={"class": "verifyimg"})
+            if not img:
+                return
+            img_src = img.get("src", "")
+            if "data:image/bmp;base64," not in img_src:
+                return
+            b64 = img_src.split("data:image/bmp;base64,", 1)[1]
+
+            SAMPLE_POINTS = [(10, 7), (7, 8), (12, 8), (10, 13), (7, 19), (12, 19), (10, 20), (6, 13), (14, 13)]
+            TEMPLATES = {
+                "0": [1, 1, 1, 1, 1, 1, 1, 1, 0], "1": [0, 1, 0, 0, 0, 0, 1, 0, 0],
+                "2": [1, 0, 1, 0, 1, 0, 1, 0, 0], "3": [1, 0, 1, 1, 0, 1, 1, 0, 0],
+                "4": [0, 0, 1, 0, 0, 1, 0, 0, 0], "5": [1, 1, 0, 0, 0, 1, 1, 0, 0],
+                "6": [1, 0, 1, 1, 1, 1, 1, 1, 0], "7": [1, 0, 1, 0, 0, 0, 0, 0, 0],
+                "8": [1, 1, 1, 1, 1, 1, 1, 0, 0], "9": [1, 1, 1, 0, 1, 0, 1, 0, 0],
+            }
+
+            data = base64.b64decode(b64)
+            if len(data) < 54 or data[:2] != b"BM":
+                return
+            w = struct.unpack_from("<i", data, 18)[0]
+            h = struct.unpack_from("<i", data, 22)[0]
+            if (w, h) != (100, 27):
+                return
+
+            stride = (100 * 3 + 3) & ~3
+
+            def is_fg(x, y, threshold=70):
+                bmp_y = 26 - y
+                offset = 54 + bmp_y * stride + x * 3
+                b, g, r = data[offset], data[offset + 1], data[offset + 2]
+                return (r + g + b) / 3 < threshold
+
+            result = []
+            one_offset = 0
+            for i in range(5):
+                char_x = i * 20
+                features = [1 if is_fg(char_x + px - one_offset, py) else 0 for px, py in SAMPLE_POINTS]
+                best_digit, min_diff = "?", float("inf")
+                for digit, template in TEMPLATES.items():
+                    diff = sum(f != t for f, t in zip(features, template))
+                    if diff < min_diff:
+                        min_diff, best_digit = diff, digit
+                    if min_diff == 0:
+                        break
+                if best_digit == "1":
+                    one_offset += 1
+                elif best_digit == "4":
+                    one_offset -= 1
+                result.append(best_digit)
+
+            text = "".join(result)
+            hex_str = "".join(f"{ord(c):x}" for c in text)
+            sep = "&" if "?" in url else "?"
+            verify_url = f"{url}{sep}security_verify_img={hex_str}"
+            session.get(verify_url, timeout=10)
+        except Exception:
+            pass
+
+    def _extract_zimuku_sub_info(self, sub, production: str, collection: bool) -> Optional[SubtitleCandidate]:
+        """解析单个 Zimuku 字幕条目"""
+        try:
+            if not sub.a:
+                return None
+            link = parse.urljoin("https://zimuku.org", sub.a.get("href"))
+            name = sub.a.text
+
+            langs = []
+            td = sub.find("td", class_="tac lang")
+            if td:
+                langs = [img.get("title", "").rstrip("字幕") for img in td.find_all("img")]
+
+            tags = {"source": [], "lang": [], "fmt": [], "bilingual": False, "production": production, "collection": collection}
+            fmt_span = sub.find("span", class_="label-info")
+            if fmt_span:
+                fmt_text = fmt_span.text.strip().lower()
+                tags["fmt"] = [f.strip() for f in fmt_text.split("/")] if "/" in fmt_text else [fmt_text]
+
+            fansub_link = sub.select_one('a[href^="/t/"]')
+            if fansub_link:
+                tags["fansub"] = fansub_link.text.strip()
+            else:
+                danger = sub.find("span", class_="label-danger")
+                if danger:
+                    tags["fansub"] = danger.text.strip()
+
+            if "简体中文" in langs:
+                tags["lang"].append("chs")
+            if "繁體中文" in langs:
+                tags["lang"].append("cht")
+            if "English" in langs:
+                tags["lang"].append("eng")
+            if "双语" in langs:
+                tags["bilingual"] = True
+
+            ext = self._extract_format_from_tags(tags.get("fmt", [])) or "srt"
+            lang = "chi" if any(l in tags["lang"] for l in ("chs", "cht")) else "eng"
+
+            return SubtitleCandidate(
+                source="Zimuku",
+                name=f"[Zimuku] {name}",
+                url=link,
+                ext=ext,
+                language=lang,
+                score=80,
+                detail_url=link,
+                tags=tags,
+            )
+        except Exception:
+            return None
+
+    def _download_zimuku(self, candidate: SubtitleCandidate) -> Optional[bytes]:
+        """下载 Zimuku 字幕"""
+        try:
+            import requests as _requests
+            session = _requests.Session()
+            session.headers.update(DEFAULT_HEADERS)
+            session.mount("https://", _requests.adapters.HTTPAdapter(max_retries=3))
+
+            detail_url = candidate.detail_url or candidate.url
+            data = self._zimuku_get_page(session, detail_url)
+            if not data:
+                return None
+
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(data, "html.parser")
+            dl_link = soup.find("li", class_="dlsub")
+            if not dl_link or not dl_link.a:
+                return None
+
+            dl_url = parse.urljoin("https://zimuku.org", dl_link.a.get("href"))
+            data = self._zimuku_get_page(session, dl_url)
+            if not data:
+                return None
+
+            soup = BeautifulSoup(data, "html.parser")
+            links_div = soup.find("div", class_="clearfix")
+            if not links_div:
+                return None
+
+            for link in links_div.find_all("a"):
+                href = link.get("href")
+                if not href:
+                    continue
+                file_url = parse.urljoin("https://zimuku.org", href)
+                try:
+                    resp = session.get(file_url, headers={"Referer": dl_url}, timeout=10)
+                    if resp is None or resp.status_code != 200:
+                        continue
+                    if len(resp.content) <= 1024:
+                        continue
+                    return self._unpack_subtitle_data(resp.content, resp.headers, file_url)
+                except Exception:
+                    continue
+            return None
+        except Exception as err:
+            self._logger.warning("Zimuku 下载失败: %s", err)
+            return None
+
+    @staticmethod
+    def _build_episode_filter(season: Optional[int], episode: Optional[int]):
+        """构建剧集过滤器，返回 (include, is_collection) 元组"""
+        if not (season and episode):
+            return lambda name: (True, False)
+        tokens = [
+            f"S{int(season):02d}E{int(episode):02d}", f"E{int(episode):02d}",
+            f"EP{int(episode):02d}", f"E{int(episode)}", f"EP{int(episode)}",
+            f"第{int(episode)}集",
+        ]
+        tag_re = re.compile(r"(S\d{1,2}\s*(E|EP)\d{1,3})|(\bEP?\d{1,3}\b)|(第\s*\d+\s*集)")
+        ep_re = re.compile(rf"(?<!\d)({'|'.join(re.escape(t) for t in tokens)})(?!\d)", re.IGNORECASE)
+
+        def fn(name):
+            upper = name.upper()
+            has_tag = tag_re.search(upper) is not None
+            matches = ep_re.search(upper) is not None
+            return (not has_tag or matches, not has_tag)
+
+        return fn
+
+    @staticmethod
+    def _extract_episode(video: Path) -> Optional[int]:
+        """从文件名提取集数"""
+        m = re.search(r"[\. _\-]?(?:S\d{1,2})?E(\d{1,3})|EP(\d{1,3})|第(\d{1,3})集", video.stem, re.IGNORECASE)
+        if m:
+            for g in m.groups():
+                if g:
+                    return int(g)
+        return None
+
+    @staticmethod
+    def _extract_season(video: Path) -> Optional[int]:
+        """从文件名或父目录提取季数"""
+        for text in (video.stem, video.parent.name):
+            m = re.search(r"S(\d{1,2})|第(\d{1,2})季", text, re.IGNORECASE)
+            if m:
+                return int(m.group(1) or m.group(2))
+        return None
+
+    @staticmethod
+    def _extract_format_from_tags(fmts: List[str]) -> Optional[str]:
+        for fmt in fmts:
+            if fmt.lower() in ("ass", "ssa", "srt"):
+                return fmt.lower()
+        return None
+
+    # ── 字幕解压 ────────────────────────────────────────────────────
+
+    def _unpack_subtitle_data(self, data: bytes, headers: Any, url: str) -> Optional[bytes]:
+        """解压字幕包，如果已经是字幕文件则直接返回"""
+        cd = headers.get("Content-Disposition", "") if hasattr(headers, "get") else ""
+        filename = self._filename_from_cd(cd) or os.path.basename(parse.urlparse(url).path) or "subtitle.srt"
+
+        ext = Path(filename).suffix.lower()
+        if ext in SUBTITLE_EXTS_TUPLE:
+            return data
+
+        if ext == ".zip":
+            return self._unpack_zip(data)
+
+        return data
+
+    @staticmethod
+    def _filename_from_cd(cd: str) -> str:
+        if not cd:
+            return ""
+        fname_star = re.findall(r"filename\*\s*=\s*(\".*?\"|[^;]+)", cd, flags=re.IGNORECASE)
+        if fname_star:
+            raw = fname_star[0].strip().strip('"').strip("'")
+            if "''" in raw:
+                raw = raw.split("''", 1)[1]
+            return html.unescape(parse.unquote(raw))
+        fname = re.findall(r"filename\s*=\s*(\".*?\"|[^;]+)", cd, flags=re.IGNORECASE)
+        if fname:
+            return html.unescape(fname[0].strip().strip('"').strip("'"))
+        return ""
+
+    def _unpack_zip(self, data: bytes) -> Optional[bytes]:
+        """解压 ZIP 文件，返回第一个字幕文件的内容（支持 GBK 编码文件名）"""
+        import io
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    # 修复 GBK 编码文件名（中文 ZIP 包常见）
+                    name = self._fix_zip_filename(info)
+                    if Path(name).suffix.lower() in SUBTITLE_EXTS_TUPLE:
+                        return zf.read(info)
+        except Exception as err:
+            self._logger.warning("ZIP 解压失败: %s", err)
+        return None
+
+    @staticmethod
+    def _fix_zip_filename(info: zipfile.ZipInfo) -> str:
+        """修复 ZIP 文件中的 GBK 编码文件名"""
+        try:
+            # flag_bits bit 11 (0x800) = UTF-8 编码标志
+            if info.flag_bits & 0x800:
+                return info.filename
+            # 尝试 GBK 解码
+            raw = info.filename.encode("cp437")
+            return raw.decode("gbk")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return info.filename
 
     def _ai_filter_candidates(self, video: Path, candidates: List[SubtitleCandidate]) -> List[SubtitleCandidate]:
         if not candidates or len(candidates) < 2:
@@ -1079,6 +1813,22 @@ class MeiamSubtitles(_PluginBase):
         return next((score for keyword, score in keywords if keyword.lower() in name.lower()), 0)
 
     @staticmethod
+    def _lang_tier(candidate: SubtitleCandidate) -> int:
+        """语言优先级：简中+双语(0) > 简中(1) > 繁中+双语(2) > 繁中(3) > 英文(4)"""
+        tags = getattr(candidate, "tags", {}) or {}
+        langs = set(tags.get("lang", []))
+        bilingual = tags.get("bilingual", False)
+        if "chs" in langs and bilingual:
+            return 4
+        if "chs" in langs:
+            return 3
+        if "cht" in langs and bilingual:
+            return 2
+        if "cht" in langs:
+            return 1
+        return 0
+
+    @staticmethod
     def _format_priority(ext: str) -> int:
         ext = (ext or "").lower()
         if ext in {"ass", "ssa"}:
@@ -1118,7 +1868,7 @@ class MeiamSubtitles(_PluginBase):
         self.cache.set("records", records[-100:])
 
     def _configured_sources(self) -> Set[str]:
-        return {item.lower() for item in self._split_config(self._sources)} or {"shooter", "thunder"}
+        return {item.lower() for item in self._split_config(self._sources)} or {"shooter", "thunder", "subhd", "zimuku"}
 
     def _configured_languages(self) -> List[str]:
         languages = [self._normalize_language(item) for item in self._split_config(self._languages)]
