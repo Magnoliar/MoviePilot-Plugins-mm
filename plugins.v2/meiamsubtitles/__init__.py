@@ -902,6 +902,7 @@ class MeiamSubtitles(_PluginBase):
         """通过豆瓣解析影片元数据，返回 {id, title, year, type} 或 None"""
         title = self._extract_title(video)
         if not title:
+            self._logger.info("豆瓣: 无法从文件名提取标题: %s", video.name)
             return None
         queries = [title]
         if video.parent.name:
@@ -909,9 +910,12 @@ class MeiamSubtitles(_PluginBase):
             if parent_title and parent_title != title:
                 queries.insert(0, parent_title)
         for query in queries:
+            self._logger.info("豆瓣: 搜索 '%s'", query)
             result = self._douban_search(query)
             if result:
+                self._logger.info("豆瓣: 找到 %s (ID:%s, %s)", result.get("title"), result.get("id"), result.get("type"))
                 return result
+        self._logger.warning("豆瓣: 所有查询均未找到结果")
         return None
 
     def _douban_search(self, query: str) -> Optional[Dict[str, Any]]:
@@ -930,7 +934,8 @@ class MeiamSubtitles(_PluginBase):
                     if resp.status != 200:
                         break
                     html_text = resp.read().decode("utf-8", errors="ignore")
-            except Exception:
+            except Exception as err:
+                self._logger.warning("豆瓣搜索请求失败 '%s': %s", query, err)
                 break
 
             match = re.search(r"window\.__DATA__\s*=\s*({.+?});", html_text, re.DOTALL)
@@ -957,15 +962,26 @@ class MeiamSubtitles(_PluginBase):
 
     @staticmethod
     def _extract_title(video: Path) -> str:
-        """从文件名提取影片标题（去除年份、编码信息等）"""
+        """从文件名提取影片标题（去除编码信息等，保留中文片名）"""
         name = video.stem
-        # 去除常见标签
+        # 只去除明确的编码/质量标签，保留中文和数字
         name = re.sub(r"[\.\-_]?(1080[pi]|720p|2160p|4K|BluRay|BDRip|WEBRip|HDRip|DVDRip|H\.?264|H\.?265|HEVC|x264|x265|AAC|DTS|FLAC|AC3|REMUX|AMZN|NF|ATVP|DSNP)", "", name, flags=re.IGNORECASE)
         name = re.sub(r"[\.\-_]?(S\d{1,2}E\d{1,3}|E\d{1,3}|EP\d{1,3})", "", name, flags=re.IGNORECASE)
-        name = re.sub(r"[\.\-_]?\d{4}", "", name)
-        # 用点、下划线、空格分隔取第一段
+        # 用点、下划线、空格分隔，取前面有意义的部分
         parts = re.split(r"[\.\_\s]+", name.strip())
-        title = " ".join(p for p in parts if p and not re.match(r"^[\[\(\{]", p))[:50]
+        # 过滤掉纯数字年份（4位）和编码相关短词，但保留中文和有意义的英文
+        meaningful = []
+        for p in parts:
+            if not p:
+                continue
+            # 跳过纯4位数字年份
+            if re.match(r"^\d{4}$", p):
+                continue
+            # 跳过方括号内容（如 [BD]、[FLAC]）
+            if re.match(r"^[\[\(\{].*[\]\)\}]$", p):
+                continue
+            meaningful.append(p)
+        title = " ".join(meaningful)[:50]
         return title.strip()
 
     # ── SubHD 字幕源 ────────────────────────────────────────────────
@@ -973,6 +989,7 @@ class MeiamSubtitles(_PluginBase):
     def _search_subhd(self, video: Path, language: str, douban_info: Optional[Dict] = None) -> List[SubtitleCandidate]:
         """从 SubHD 搜索字幕"""
         if not douban_info:
+            self._logger.info("SubHD: 无豆瓣信息，跳过搜索")
             return []
         try:
             import requests as _requests
@@ -980,6 +997,7 @@ class MeiamSubtitles(_PluginBase):
             session.headers.update(DEFAULT_HEADERS)
 
             douban_id = douban_info.get("id")
+            self._logger.info("SubHD: 搜索豆瓣 ID %s", douban_id)
             search_url = f"https://subhd.tv/search/{douban_id}"
             resp = session.get(search_url, timeout=self._timeout)
             if resp.status_code != 200:
@@ -1105,6 +1123,7 @@ class MeiamSubtitles(_PluginBase):
 
     def _download_subhd(self, candidate: SubtitleCandidate) -> Optional[bytes]:
         """下载 SubHD 字幕（处理验证码）"""
+        session = None
         try:
             import requests as _requests
             session = _requests.Session()
@@ -1168,6 +1187,9 @@ class MeiamSubtitles(_PluginBase):
         except Exception as err:
             self._logger.warning("SubHD 下载失败: %s", err)
             return None
+        finally:
+            if session:
+                session.close()
 
     @staticmethod
     def _solve_subhd_captcha(svg_content: str) -> str:
@@ -1258,6 +1280,7 @@ class MeiamSubtitles(_PluginBase):
     def _search_zimuku(self, video: Path, language: str, douban_info: Optional[Dict] = None) -> List[SubtitleCandidate]:
         """从 Zimuku 搜索字幕"""
         if not douban_info:
+            self._logger.info("Zimuku: 无豆瓣信息，跳过搜索")
             return []
         try:
             import requests as _requests
@@ -1266,6 +1289,7 @@ class MeiamSubtitles(_PluginBase):
             session.mount("https://", _requests.adapters.HTTPAdapter(max_retries=3))
 
             douban_id = douban_info.get("id")
+            self._logger.info("Zimuku: 搜索豆瓣 ID %s", douban_id)
             search_url = f"https://zimuku.org/search?q={parse.quote(str(douban_id))}&chost=zimuku.org"
             resp = self._zimuku_get_page(session, search_url)
             if not resp:
@@ -1441,6 +1465,7 @@ class MeiamSubtitles(_PluginBase):
 
     def _download_zimuku(self, candidate: SubtitleCandidate) -> Optional[bytes]:
         """下载 Zimuku 字幕"""
+        session = None
         try:
             import requests as _requests
             session = _requests.Session()
@@ -1486,6 +1511,9 @@ class MeiamSubtitles(_PluginBase):
         except Exception as err:
             self._logger.warning("Zimuku 下载失败: %s", err)
             return None
+        finally:
+            if session:
+                session.close()
 
     @staticmethod
     def _build_episode_filter(season: Optional[int], episode: Optional[int]):
