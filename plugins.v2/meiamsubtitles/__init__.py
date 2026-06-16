@@ -803,6 +803,12 @@ class MeiamSubtitles(_PluginBase):
             ),
             reverse=True,
         )
+        self._logger.info("搜索完成: %s | 共 %d 条候选 (射手:%d 迅雷:%d SubHD:%d Zimuku:%d)",
+            video.name, len(sorted_candidates),
+            sum(1 for c in candidates if c.source == "射手"),
+            sum(1 for c in candidates if c.source == "迅雷"),
+            sum(1 for c in candidates if c.source == "SubHD"),
+            sum(1 for c in candidates if c.source == "Zimuku"))
         return self._ai_filter_candidates(video, sorted_candidates) if self._enable_ai_filter else sorted_candidates
 
     def _search_shooter(self, video: Path, language: str) -> List[SubtitleCandidate]:
@@ -991,6 +997,7 @@ class MeiamSubtitles(_PluginBase):
         if not douban_info:
             self._logger.info("SubHD: 无豆瓣信息，跳过搜索")
             return []
+        session = None
         try:
             import requests as _requests
             session = _requests.Session()
@@ -1001,16 +1008,19 @@ class MeiamSubtitles(_PluginBase):
             search_url = f"https://subhd.tv/search/{douban_id}"
             resp = session.get(search_url, timeout=self._timeout)
             if resp.status_code != 200:
+                self._logger.warning("SubHD: 搜索页 HTTP %s", resp.status_code)
                 return []
 
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "html.parser")
             container = soup.select_one("div.col-lg-9")
             if not container:
+                self._logger.info("SubHD: 搜索页无结果容器")
                 return []
 
             link = container.select_one('a[href^="/d/"]')
             if not link:
+                self._logger.info("SubHD: 未找到字幕页链接")
                 return []
 
             m = re.search(r"/d/(\d+)", link.get("href", ""))
@@ -1021,12 +1031,18 @@ class MeiamSubtitles(_PluginBase):
             detail_url = f"https://subhd.tv/d/{detail_id}"
             resp = session.get(detail_url, timeout=self._timeout)
             if resp.status_code != 200:
+                self._logger.warning("SubHD: 字幕列表页 HTTP %s", resp.status_code)
                 return []
 
-            return self._parse_subhd_subtitles(resp.text, video, douban_info)
+            results = self._parse_subhd_subtitles(resp.text, video, douban_info)
+            self._logger.info("SubHD: 找到 %d 条字幕", len(results))
+            return results
         except Exception as err:
             self._logger.warning("SubHD 搜索失败: %s", err)
             return []
+        finally:
+            if session:
+                session.close()
 
     def _parse_subhd_subtitles(self, html_text: str, video: Path, douban_info: Dict) -> List[SubtitleCandidate]:
         """解析 SubHD 字幕列表页面"""
@@ -1282,6 +1298,7 @@ class MeiamSubtitles(_PluginBase):
         if not douban_info:
             self._logger.info("Zimuku: 无豆瓣信息，跳过搜索")
             return []
+        session = None
         try:
             import requests as _requests
             session = _requests.Session()
@@ -1293,22 +1310,27 @@ class MeiamSubtitles(_PluginBase):
             search_url = f"https://zimuku.org/search?q={parse.quote(str(douban_id))}&chost=zimuku.org"
             resp = self._zimuku_get_page(session, search_url)
             if not resp:
+                self._logger.info("Zimuku: 搜索页无响应")
                 return []
 
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp, "html.parser")
             link = soup.find("a", href=re.compile(r"/subs/\d+\.html"))
             if not link:
+                self._logger.info("Zimuku: 未找到字幕页链接")
                 return []
 
             subs_url = parse.urljoin("https://zimuku.org", link.get("href"))
+            self._logger.info("Zimuku: 字幕页 %s", subs_url)
             resp = self._zimuku_get_page(session, subs_url)
             if not resp:
+                self._logger.warning("Zimuku: 字幕页无响应")
                 return []
 
             soup = BeautifulSoup(resp, "html.parser")
             box = soup.select_one("div.subs.box.clearfix")
             if not box or not box.tbody:
+                self._logger.info("Zimuku: 字幕列表为空")
                 return []
 
             subs = box.tbody.find_all("tr")
@@ -1325,10 +1347,14 @@ class MeiamSubtitles(_PluginBase):
                 info = self._extract_zimuku_sub_info(sub, prod, is_coll)
                 if info:
                     results.append(info)
+            self._logger.info("Zimuku: 找到 %d 条字幕", len(results))
             return results
         except Exception as err:
             self._logger.warning("Zimuku 搜索失败: %s", err)
             return []
+        finally:
+            if session:
+                session.close()
 
     def _zimuku_get_page(self, session, url: str, max_retries: int = 3) -> Optional[bytes]:
         """获取 Zimuku 页面，自动处理验证码"""
@@ -1576,7 +1602,13 @@ class MeiamSubtitles(_PluginBase):
         if ext == ".zip":
             return self._unpack_zip(data)
 
-        return data
+        # 未知扩展名，检查内容是否像字幕
+        if ext in (".rar", ".7z"):
+            self._logger.info("不支持的压缩格式 %s: %s", ext, filename)
+            return None
+
+        self._logger.warning("未知文件类型 %s: %s", ext, filename)
+        return None
 
     @staticmethod
     def _filename_from_cd(cd: str) -> str:
@@ -1774,7 +1806,6 @@ class MeiamSubtitles(_PluginBase):
             f"{video.stem}.{suffix}.*",
             f"{video.stem}.{language}.*",
             f"{video.stem}.zh.*" if language == "chi" else f"{video.stem}.en.*",
-            f"{video.stem}.*",
         ]
         found: List[Path] = []
         for pattern in patterns:
