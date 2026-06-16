@@ -72,7 +72,7 @@ class MeiamSubtitles(_PluginBase):
     plugin_name = "Meiam 自动字幕"
     plugin_desc = "入库后自动从射手网、迅雷看看、SubHD、Zimuku 下载同名字幕"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosubtitles.jpeg"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "Meiam/mm"
     auth_level = 1
 
