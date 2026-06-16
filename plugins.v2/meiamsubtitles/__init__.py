@@ -124,6 +124,18 @@ class MeiamSubtitles(_PluginBase):
         log_dir.mkdir(parents=True, exist_ok=True)
         self._logger = logging.getLogger(f"plugin.{self.__class__.__name__}")
         self._logger.setLevel(logging.INFO)
+        # 避免重复添加 handler（插件重载时）
+        if not self._logger.handlers:
+            # 文件日志
+            fh = logging.FileHandler(log_dir / "meiam_subtitles.log", encoding="utf-8")
+            fh.setLevel(logging.INFO)
+            fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            self._logger.addHandler(fh)
+            # 控制台日志（MoviePilot 主日志可见）
+            sh = logging.StreamHandler()
+            sh.setLevel(logging.INFO)
+            sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            self._logger.addHandler(sh)
 
     def get_state(self) -> bool:
         return self._enabled
@@ -460,11 +472,15 @@ class MeiamSubtitles(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        records = self.cache.get("records") or []
+        try:
+            records = self.cache.get("records") or []
+        except Exception:
+            records = []
         rows = [
             {
                 "component": "tr",
                 "content": [
+                    {"component": "td", "text": item.get("time", "")},
                     {"component": "td", "text": item.get("video", "")},
                     {"component": "td", "text": item.get("language", "")},
                     {"component": "td", "text": item.get("source", "")},
@@ -485,6 +501,7 @@ class MeiamSubtitles(_PluginBase):
                             {
                                 "component": "tr",
                                 "content": [
+                                    {"component": "th", "text": "时间"},
                                     {"component": "th", "text": "视频"},
                                     {"component": "th", "text": "语言"},
                                     {"component": "th", "text": "来源"},
@@ -1855,17 +1872,22 @@ class MeiamSubtitles(_PluginBase):
         return None
 
     def _record(self, video: Path, language: str, source: str, status: str, path: str):
-        records = self.cache.get("records") or []
-        records.append(
-            {
-                "video": video.name,
-                "language": language,
-                "source": source,
-                "status": status,
-                "path": path,
-            }
-        )
-        self.cache.set("records", records[-100:])
+        try:
+            records = self.cache.get("records") or []
+            records.append(
+                {
+                    "video": video.name,
+                    "language": language,
+                    "source": source,
+                    "status": status,
+                    "path": path,
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+            self.cache.set("records", records[-100:])
+            self._logger.info("记录: %s | %s | %s | %s", video.name, language, source, status)
+        except Exception as err:
+            self._logger.warning("记录保存失败: %s", err)
 
     def _configured_sources(self) -> Set[str]:
         return {item.lower() for item in self._split_config(self._sources)} or {"shooter", "thunder", "subhd", "zimuku"}
