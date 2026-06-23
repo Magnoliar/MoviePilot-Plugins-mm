@@ -72,7 +72,7 @@ class MeiamSubtitles(_PluginBase):
     plugin_name = "Meiam 自动字幕"
     plugin_desc = "入库后自动从射手网、迅雷看看、SubHD、Zimuku 下载同名字幕"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosubtitles.jpeg"
-    plugin_version = "1.2.4"
+    plugin_version = "1.2.5"
     plugin_author = "Meiam/mm"
     auth_level = 1
 
@@ -1672,27 +1672,71 @@ class MeiamSubtitles(_PluginBase):
 
     def _unpack_subtitle_data(self, data: bytes, headers: Any, url: str) -> Optional[bytes]:
         """解压字幕包，如果已经是字幕文件则直接返回"""
-        cd = headers.get("Content-Disposition", "") if hasattr(headers, "get") else ""
-        filename = self._filename_from_cd(cd) or os.path.basename(parse.urlparse(url).path) or "subtitle.srt"
+        if not data or len(data) < 4:
+            return None
 
+        cd = headers.get("Content-Disposition", "") if hasattr(headers, "get") else ""
+        filename = self._filename_from_cd(cd) or os.path.basename(parse.urlparse(url).path) or "subtitle.bin"
         ext = Path(filename).suffix.lower()
+
+        # 1. 按扩展名处理已知格式
         if ext in SUBTITLE_EXTS_TUPLE:
             return data
-
         if ext == ".zip":
             return self._unpack_zip(data)
 
-        if ext in (".rar", ".7z"):
-            self._logger.info("不支持的压缩格式 %s: %s", ext, filename)
-            return None
+        # 2. 通过文件头 magic bytes 检测实际格式
+        magic = data[:8]
+        # ZIP (PK\x03\x04)
+        if magic[:4] == b'PK\x03\x04':
+            self._logger.info("从文件头检测到 ZIP: %s", filename)
+            return self._unpack_zip(data)
+        # RAR (Rar!\x1a\x07)
+        if magic[:4] == b'Rar!':
+            return self._unpack_rar(data, filename)
+        # 7z (7z\xbc\xaf\x27\x1c)
+        if magic[:6] == b'7z\xbc\xaf\x27\x1c':
+            return self._unpack_7z(data, filename)
 
-        # URL/Content-Disposition 无法识别扩展名时，从文件内容检测格式
+        # 3. 检测是否为裸字幕内容（SRT/ASS/SSA）
         detected = self._detect_subtitle_format(data)
         if detected:
-            self._logger.info("从内容检测到字幕格式: %s (原文件名: %s)", detected, filename)
+            self._logger.info("从内容检测到 %s 字幕: %s", detected.upper(), filename)
             return data
 
-        self._logger.warning("未知文件类型 %s: %s (内容前20字节: %s)", ext, filename, data[:20])
+        self._logger.warning("无法识别的文件格式: %s (magic=%s, size=%d)", filename, magic[:4].hex(), len(data))
+        return None
+
+    def _unpack_rar(self, data: bytes, filename: str) -> Optional[bytes]:
+        """解压 RAR 文件"""
+        try:
+            import rarfile
+            import io
+            with rarfile.RarFile(io.BytesIO(data)) as rf:
+                for info in rf.infolist():
+                    if info.is_dir():
+                        continue
+                    if Path(info.filename).suffix.lower() in SUBTITLE_EXTS_TUPLE:
+                        return rf.read(info)
+        except ImportError:
+            self._logger.warning("RAR 解压需要安装 rarfile: pip install rarfile (文件: %s)", filename)
+        except Exception as err:
+            self._logger.warning("RAR 解压失败: %s (%s)", err, filename)
+        return None
+
+    def _unpack_7z(self, data: bytes, filename: str) -> Optional[bytes]:
+        """解压 7z 文件"""
+        try:
+            import py7zr
+            import io
+            with py7zr.SevenZipFile(io.BytesIO(data), mode='r') as sz:
+                for name, bio in sz.readall().items():
+                    if Path(name).suffix.lower() in SUBTITLE_EXTS_TUPLE:
+                        return bio.read()
+        except ImportError:
+            self._logger.warning("7z 解压需要安装 py7zr: pip install py7zr (文件: %s)", filename)
+        except Exception as err:
+            self._logger.warning("7z 解压失败: %s (%s)", err, filename)
         return None
 
     @staticmethod
@@ -1700,18 +1744,13 @@ class MeiamSubtitles(_PluginBase):
         """从文件内容检测字幕格式"""
         if not data or len(data) < 10:
             return None
-        # SRT: BOM + 数字序号 或 直接以数字序号开头
         head = data[:200]
         if head.startswith(b'\xef\xbb\xbf'):
             head = head[3:]
         if re.match(rb'\d+\s*\r?\n\d{2}:\d{2}:\d{2}', head):
             return "srt"
-        # ASS/SSA: [Script Info] 或 [V4+ Styles]
-        if b'[Script Info]' in head or b'[V4+ Styles]' in head:
+        if b'[Script Info]' in head:
             return "ass"
-        # SSA
-        if b'[Script Info]' in head and b'PlayResX' in head:
-            return "ssa"
         return None
 
     @staticmethod

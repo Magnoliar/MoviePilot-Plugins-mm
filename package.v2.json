@@ -12,7 +12,7 @@
     "name": "Meiam 自动字幕",
     "description": "入库后自动从射手网、迅雷看看、SubHD、Zimuku 下载同名字幕。",
     "labels": "媒体管理,字幕",
-    "version": "1.2.4",
+    "version": "1.2.5",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosubtitles.jpeg",
     "author": "Meiam/mm",
     "level": 1
