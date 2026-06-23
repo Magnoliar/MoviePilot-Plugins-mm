@@ -72,7 +72,7 @@ class MeiamSubtitles(_PluginBase):
     plugin_name = "Meiam 自动字幕"
     plugin_desc = "入库后自动从射手网、迅雷看看、SubHD、Zimuku 下载同名字幕"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosubtitles.jpeg"
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.4"
     plugin_author = "Meiam/mm"
     auth_level = 1
 
@@ -774,24 +774,37 @@ class MeiamSubtitles(_PluginBase):
             self._record(video, language, "", "未找到", "")
             return False, "未搜索到字幕"
 
-        best = candidates[0]
+        # 按源分组，每个源只取排名第一的候选，避免同一源反复请求
+        seen_sources = set()
+        best_per_source = []
+        for c in candidates:
+            if c.source not in seen_sources:
+                seen_sources.add(c.source)
+                best_per_source.append(c)
 
-        # SubHD 和 Zimuku 使用专用下载方法
-        if best.source == "SubHD":
-            content = self._download_subhd(best)
-        elif best.source == "Zimuku":
-            content = self._download_zimuku(best)
-        else:
-            content = self._http_bytes(best.url)
+        # 依次尝试不同源
+        for i, candidate in enumerate(best_per_source):
+            self._logger.info("尝试源[%d/%d]: %s %s", i + 1, len(best_per_source), candidate.source, candidate.name[:40])
 
-        if not content:
-            self._record(video, language, best.source, "下载失败", best.url)
-            return False, "字幕下载失败"
+            if candidate.source == "SubHD":
+                content = self._download_subhd(candidate)
+            elif candidate.source == "Zimuku":
+                content = self._download_zimuku(candidate)
+            else:
+                content = self._http_bytes(candidate.url)
 
-        sub_path = self._subtitle_path(video, best.ext, language)
-        sub_path.write_bytes(content)
-        self._record(video, language, best.source, "已下载", str(sub_path))
-        return True, f"已下载 {best.source}: {sub_path.name}"
+            if content:
+                sub_path = self._subtitle_path(video, candidate.ext, language)
+                sub_path.write_bytes(content)
+                self._record(video, language, candidate.source, "已下载", str(sub_path))
+                if i > 0:
+                    return True, f"回退下载成功 {candidate.source}: {sub_path.name}"
+                return True, f"已下载 {candidate.source}: {sub_path.name}"
+
+            self._logger.info("源 %s 下载失败，切换到下一个源", candidate.source)
+
+        self._record(video, language, best_per_source[0].source, "下载失败", best_per_source[0].url)
+        return False, "字幕下载失败（所有源均失败）"
 
     def _search(self, video: Path, language: str) -> List[SubtitleCandidate]:
         candidates: List[SubtitleCandidate] = []
@@ -1411,11 +1424,14 @@ class MeiamSubtitles(_PluginBase):
                 if resp.status_code == 200 and b'class="verifyimg"' not in resp.content:
                     return resp.content
                 if b'class="verifyimg"' in resp.content and attempt < max_retries:
+                    self._logger.info("Zimuku: 验证码触发 (attempt %d/%d) %s", attempt + 1, max_retries, url[:60])
                     self._solve_zimuku_captcha(session, url, resp.content)
                     continue
                 if resp.status_code != 200:
+                    self._logger.warning("Zimuku: HTTP %s -> %s", resp.status_code, url[:80])
                     return None
-            except Exception:
+            except Exception as e:
+                self._logger.warning("Zimuku: 请求异常 %s -> %s", url[:80], e)
                 return None
         return None
 
@@ -1546,27 +1562,35 @@ class MeiamSubtitles(_PluginBase):
             session.mount("https://", _requests.adapters.HTTPAdapter(max_retries=3))
 
             detail_url = candidate.detail_url or candidate.url
+            self._logger.info("Zimuku 下载: 详情页 %s", detail_url)
             data = self._zimuku_get_page(session, detail_url)
             if not data:
+                self._logger.warning("Zimuku 下载: 详情页获取失败 (验证码或网络问题)")
                 return None
 
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(data, "html.parser")
             dl_link = soup.find("li", class_="dlsub")
             if not dl_link or not dl_link.a:
+                self._logger.warning("Zimuku 下载: 未找到 li.dlsub 链接，页面长度 %d", len(data))
                 return None
 
             dl_url = parse.urljoin("https://zimuku.org", dl_link.a.get("href"))
+            self._logger.info("Zimuku 下载: 下载页 %s", dl_url)
             data = self._zimuku_get_page(session, dl_url)
             if not data:
+                self._logger.warning("Zimuku 下载: 下载页获取失败")
                 return None
 
             soup = BeautifulSoup(data, "html.parser")
             links_div = soup.find("div", class_="clearfix")
             if not links_div:
+                self._logger.warning("Zimuku 下载: 未找到 div.clearfix 容器，页面长度 %d", len(data))
                 return None
 
-            for link in links_div.find_all("a"):
+            links = links_div.find_all("a")
+            self._logger.info("Zimuku 下载: 找到 %d 个下载链接", len(links))
+            for i, link in enumerate(links):
                 href = link.get("href")
                 if not href:
                     continue
@@ -1574,12 +1598,21 @@ class MeiamSubtitles(_PluginBase):
                 try:
                     resp = session.get(file_url, headers={"Referer": dl_url}, timeout=10)
                     if resp is None or resp.status_code != 200:
+                        self._logger.info("Zimuku 下载: 链接[%d] HTTP %s", i, getattr(resp, 'status_code', 'None'))
                         continue
-                    if len(resp.content) <= 1024:
+                    size = len(resp.content)
+                    if size <= 1024:
+                        self._logger.info("Zimuku 下载: 链接[%d] 过小 (%d bytes)", i, size)
                         continue
+                    self._logger.info("Zimuku 下载: 链接[%d] 成功 (%d bytes)", i, size)
                     return self._unpack_subtitle_data(resp.content, resp.headers, file_url)
-                except Exception:
+                except Exception as e:
+                    self._logger.info("Zimuku 下载: 链接[%d] 异常 %s", i, e)
                     continue
+            self._logger.warning("Zimuku 下载: 所有 %d 个链接均无效", len(links))
+            return None
+        except ImportError as err:
+            self._logger.error("Zimuku 下载缺少依赖: %s", err)
             return None
         except Exception as err:
             self._logger.warning("Zimuku 下载失败: %s", err)
