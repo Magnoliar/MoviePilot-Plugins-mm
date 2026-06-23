@@ -1682,12 +1682,36 @@ class MeiamSubtitles(_PluginBase):
         if ext == ".zip":
             return self._unpack_zip(data)
 
-        # 未知扩展名，检查内容是否像字幕
         if ext in (".rar", ".7z"):
             self._logger.info("不支持的压缩格式 %s: %s", ext, filename)
             return None
 
-        self._logger.warning("未知文件类型 %s: %s", ext, filename)
+        # URL/Content-Disposition 无法识别扩展名时，从文件内容检测格式
+        detected = self._detect_subtitle_format(data)
+        if detected:
+            self._logger.info("从内容检测到字幕格式: %s (原文件名: %s)", detected, filename)
+            return data
+
+        self._logger.warning("未知文件类型 %s: %s (内容前20字节: %s)", ext, filename, data[:20])
+        return None
+
+    @staticmethod
+    def _detect_subtitle_format(data: bytes) -> Optional[str]:
+        """从文件内容检测字幕格式"""
+        if not data or len(data) < 10:
+            return None
+        # SRT: BOM + 数字序号 或 直接以数字序号开头
+        head = data[:200]
+        if head.startswith(b'\xef\xbb\xbf'):
+            head = head[3:]
+        if re.match(rb'\d+\s*\r?\n\d{2}:\d{2}:\d{2}', head):
+            return "srt"
+        # ASS/SSA: [Script Info] 或 [V4+ Styles]
+        if b'[Script Info]' in head or b'[V4+ Styles]' in head:
+            return "ass"
+        # SSA
+        if b'[Script Info]' in head and b'PlayResX' in head:
+            return "ssa"
         return None
 
     @staticmethod
